@@ -541,6 +541,20 @@ func (sc *serverConn) writeReset(strm uint32, code ErrorCode) {
 	}
 }
 
+// updateWindow sends a WINDOW_UPDATE to replenish the peer's send window
+// after consuming DATA. A streamID of 0 refills the connection window.
+func (sc *serverConn) updateWindow(streamID uint32, size int) {
+	fr := AcquireFrameHeader()
+	fr.SetStream(streamID)
+
+	wu := AcquireFrame(FrameWindowUpdate).(*WindowUpdate)
+	wu.SetIncrement(size)
+
+	fr.SetBody(wu)
+
+	sc.writeFrame(fr)
+}
+
 func (sc *serverConn) writeGoAway(strm uint32, code ErrorCode, message string) {
 	ga := AcquireFrame(FrameGoAway).(*GoAway)
 
@@ -677,6 +691,21 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 
 		if strm.State() >= StreamStateHalfClosed {
 			return NewGoAwayError(StreamClosedError, "stream closed")
+		}
+
+		if fr.Len() > 0 {
+			// fr.Len() covers the whole payload (including any padding),
+			// which is what flow control accounts for.
+			sc.currentWindow -= int32(fr.Len())
+
+			if !fr.Flags().Has(FlagEndStream) {
+				sc.updateWindow(fr.Stream(), fr.Len())
+			}
+
+			if sc.currentWindow < sc.maxWindow/2 {
+				sc.updateWindow(0, int(sc.maxWindow-sc.currentWindow))
+				sc.currentWindow = sc.maxWindow
+			}
 		}
 
 		strm.ctx.Request.AppendBody(

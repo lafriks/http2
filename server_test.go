@@ -243,6 +243,99 @@ func TestIssue27(t *testing.T) {
 	}
 }
 
+func TestUploadReplenishesWindow(t *testing.T) {
+	var gotBody int
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				gotBody = len(ctx.Request.Body())
+				io.WriteString(ctx, "OK")
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	// more than half the server's 4MB connection window, so the
+	// connection-level refill must trigger
+	body := make([]byte, 3<<20)
+
+	h1 := makeHeaders(3, c.enc, true, false, map[string]string{
+		string(StringAuthority): "localhost",
+		string(StringMethod):    "POST",
+		string(StringPath):      "/upload",
+		string(StringScheme):    "https",
+		"Content-Length":        strconv.Itoa(len(body)),
+	})
+
+	writeErr := make(chan error, 1)
+	go func() {
+		c.writeFrame(h1)
+
+		err := writeData(c.bw, h1, body)
+		if err == nil {
+			err = c.bw.Flush()
+		}
+
+		writeErr <- err
+	}()
+
+	var strmWin, connWin int
+	respDone := false
+
+	for !respDone {
+		fr, err := c.readNext()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		switch fr.Type() {
+		case FrameWindowUpdate:
+			// readNext consumes stream-0 window updates internally and adds
+			// them to serverWindow, so only stream updates arrive here
+			if fr.Stream() == 3 {
+				strmWin += fr.Body().(*WindowUpdate).Increment()
+			}
+		case FrameData:
+			respDone = fr.Flags().Has(FlagEndStream)
+		}
+
+		ReleaseFrameHeader(fr)
+	}
+
+	if err := <-writeErr; err != nil {
+		t.Fatal(err)
+	}
+
+	if gotBody != len(body) {
+		t.Fatalf("server got %d body bytes, expected %d", gotBody, len(body))
+	}
+
+	// the connection-level refills were consumed by readNext into serverWindow;
+	// the server's handshake grants 1<<22, anything above that came from refills
+	connWin = int(c.serverWindow) - 1<<22
+	if connWin < 1<<21 {
+		t.Fatalf("expected connection window replenishment of at least %d, got %d", 1<<21, connWin)
+	}
+
+	// every DATA frame except the last (END_STREAM) must have been replenished
+	if expected := len(body) - 1<<14; strmWin < expected {
+		t.Fatalf("expected stream window replenishment of at least %d, got %d", expected, strmWin)
+	}
+}
+
 func TestIdleConnection(t *testing.T) {
 	s := &Server{
 		s: &fasthttp.Server{
