@@ -1,3 +1,8 @@
+// The whole example is commented out and kept for reference only; the build
+// tag excludes it from `go build ./...` since without main() it can't link.
+
+//go:build ignore
+
 package main
 
 // import (

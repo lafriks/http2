@@ -189,7 +189,7 @@ func (f *FrameHeader) readFrom(br *bufio.Reader) (int64, error) {
 
 	// Parsing FrameHeader's Header field.
 	f.parseValues(header)
-	if err = f.checkLen(); err != nil {
+	if err := f.checkLen(); err != nil {
 		return 0, err
 	}
 

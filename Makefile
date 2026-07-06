@@ -1,9 +1,14 @@
-.PHONY: test fmt
+.PHONY: test race fmt lint
 
 test:
-	go test -v
-	cd h2spec && go test -v
+	go test ./...
+
+race:
+	go test -race ./...
 
 fmt:
 	goimports -w .
 	gofmt -w -s .
+
+lint:
+	golangci-lint run

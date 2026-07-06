@@ -55,7 +55,7 @@ func TestFrameRead(t *testing.T) {
 		t.Fatalf("unexpected written bytes %d<>9", n)
 	}
 
-	n, err = io.WriteString(bf, testStr)
+	n, err = bf.WriteString(testStr)
 	if err != nil {
 		t.Fatal(err)
 	}

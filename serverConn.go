@@ -473,7 +473,7 @@ loop:
 
 			// the timer is created with NewTimer(0), so its startup tick can
 			// arrive late, when streams already exist; without a request
-			// timeout every stream would be considered due and cancelled
+			// timeout every stream would be considered due and canceled
 			if sc.maxRequestTime <= 0 {
 				continue loop
 			}
@@ -639,7 +639,7 @@ loop:
 						closeStream(nstrm)
 
 						if sc.debug {
-							sc.logger.Printf("Cancelling stream in idle state: %d\n", nstrm.ID())
+							sc.logger.Printf("Canceling stream in idle state: %d\n", nstrm.ID())
 						}
 
 						sc.writeReset(nstrm.ID(), StreamCanceled)

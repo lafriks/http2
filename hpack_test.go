@@ -31,8 +31,8 @@ func TestAcquireHPACKAndReleaseHPACK(t *testing.T) {
 	http2utils.AssertEqual(t, false, hp2.DisableCompression)
 	http2utils.AssertEqual(t, false, hp2.DisableDynamicTable)
 	http2utils.AssertEqual(t, 0, len(hp2.dynamic))
-	http2utils.AssertEqual(t, uint32(defaultHeaderTableSize), hp2.maxTableSize)
-	http2utils.AssertEqual(t, uint32(defaultHeaderTableSize), hp2.maxTableSizeSettings)
+	http2utils.AssertEqual(t, defaultHeaderTableSize, hp2.maxTableSize)
+	http2utils.AssertEqual(t, defaultHeaderTableSize, hp2.maxTableSizeSettings)
 }
 
 func TestHPACKAppendInt(t *testing.T) {

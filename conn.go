@@ -493,7 +493,7 @@ func (c *Conn) writeFrame(fr *FrameHeader) error {
 
 	_, err := fr.WriteTo(c.bw)
 	if err == nil {
-		if err = c.bw.Flush(); err != nil {
+		if err := c.bw.Flush(); err != nil {
 			return err
 		}
 	}

@@ -55,9 +55,9 @@ func main() {
 			if err != nil {
 				log.Println(err)
 
-				res.Header.VisitAll(func(k, v []byte) {
+				for k, v := range res.Header.All() {
 					fmt.Printf("%s: %s\n", k, v)
-				})
+				}
 
 				return
 			}

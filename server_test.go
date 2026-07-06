@@ -38,8 +38,9 @@ func getConn(s *Server) (*Conn, net.Listener, error) {
 	}
 
 	nc := NewConn(c, ConnOpts{})
+	err = nc.doHandshake()
 
-	return nc, ln, nc.doHandshake()
+	return nc, ln, err
 }
 
 func makeHeaders(id uint32, enc *HPACK, endHeaders, endStream bool, hs map[string]string) *FrameHeader {
@@ -107,7 +108,7 @@ func TestMalformedRequestIsReset(t *testing.T) {
 	s := &Server{
 		s: &fasthttp.Server{
 			Handler: func(ctx *fasthttp.RequestCtx) {
-				io.WriteString(ctx, "OK")
+				ctx.WriteString("OK")
 			},
 		},
 		cnf: ServerConfig{
@@ -234,7 +235,7 @@ func TestServerResetToleratesInFlightFrames(t *testing.T) {
 	s := &Server{
 		s: &fasthttp.Server{
 			Handler: func(ctx *fasthttp.RequestCtx) {
-				io.WriteString(ctx, "OK")
+				ctx.WriteString("OK")
 			},
 		},
 		cnf: ServerConfig{
@@ -336,7 +337,7 @@ func TestRequestBodySizeLimit(t *testing.T) {
 		s: &fasthttp.Server{
 			Handler: func(ctx *fasthttp.RequestCtx) {
 				handled++
-				io.WriteString(ctx, "OK")
+				ctx.WriteString("OK")
 			},
 			MaxRequestBodySize: 16,
 		},
@@ -471,7 +472,7 @@ func testIssue52(t *testing.T) {
 	s := &Server{
 		s: &fasthttp.Server{
 			Handler: func(ctx *fasthttp.RequestCtx) {
-				io.WriteString(ctx, "Hello world")
+				ctx.WriteString("Hello world")
 			},
 			ReadTimeout: time.Second * 30,
 		},
@@ -572,7 +573,7 @@ func TestIssue27(t *testing.T) {
 	s := &Server{
 		s: &fasthttp.Server{
 			Handler: func(ctx *fasthttp.RequestCtx) {
-				io.WriteString(ctx, "Hello world")
+				ctx.WriteString("Hello world")
 			},
 			ReadTimeout: time.Second * 1,
 		},
@@ -649,7 +650,7 @@ func TestUploadReplenishesWindow(t *testing.T) {
 		s: &fasthttp.Server{
 			Handler: func(ctx *fasthttp.RequestCtx) {
 				gotBody = len(ctx.Request.Body())
-				io.WriteString(ctx, "OK")
+				ctx.WriteString("OK")
 			},
 		},
 		cnf: ServerConfig{
@@ -740,7 +741,7 @@ func newShutdownServer(gracePeriod time.Duration) *Server {
 	return &Server{
 		s: &fasthttp.Server{
 			Handler: func(ctx *fasthttp.RequestCtx) {
-				io.WriteString(ctx, "OK")
+				ctx.WriteString("OK")
 			},
 		},
 		cnf: ServerConfig{
@@ -1295,7 +1296,7 @@ func TestIdleConnection(t *testing.T) {
 	s := &Server{
 		s: &fasthttp.Server{
 			Handler: func(ctx *fasthttp.RequestCtx) {
-				io.WriteString(ctx, "Hello world")
+				ctx.WriteString("Hello world")
 			},
 			ReadTimeout: time.Second * 5,
 			IdleTimeout: time.Second * 2,
