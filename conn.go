@@ -384,7 +384,7 @@ func (we WriteError) Is(target error) bool {
 	return errors.Is(we.err, target)
 }
 
-func (we WriteError) As(target interface{}) bool {
+func (we WriteError) As(target any) bool {
 	return errors.As(we.err, target)
 }
 
@@ -409,7 +409,7 @@ func (c *Conn) writeLoop() {
 			lastErr = io.ErrUnexpectedEOF
 		}
 
-		c.reqQueued.Range(func(_, v interface{}) bool {
+		c.reqQueued.Range(func(_, v any) bool {
 			r := v.(*Ctx)
 			r.resolve(lastErr)
 

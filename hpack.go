@@ -50,7 +50,7 @@ func headerFieldsToString(hfs []*HeaderField, indexOffset int) string {
 }
 
 var hpackPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &HPACK{
 			maxTableSize:         defaultHeaderTableSize,
 			maxTableSizeSettings: defaultHeaderTableSize,
@@ -200,7 +200,7 @@ const (
 )
 
 var bytePool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return make([]byte, 128)
 	},
 }
@@ -271,6 +271,10 @@ loop:
 
 		// Reading value
 		if err == nil {
+			if len(b) == 0 {
+				return b, ErrUnexpectedSize
+			}
+
 			if b[0] == c {
 				b = b[1:]
 			}
@@ -321,6 +325,10 @@ loop:
 
 		// Reading value
 		if err == nil {
+			if len(b) == 0 {
+				return b, ErrUnexpectedSize
+			}
+
 			if b[0] == c {
 				b = b[1:]
 			}
@@ -377,13 +385,19 @@ func readInt(n int, b []byte) ([]byte, uint64) {
 	for i < len(b) {
 		nn |= uint64(b[i]&127) << ((i - 1) * 7)
 		if b[i]&128 != 128 {
-			break
+			// b[i] is the terminating byte, so it and everything
+			// before it have been consumed.
+			return b[i+1:], nn + uint64(b0)
 		}
 
 		i++
 	}
 
-	return b[i+1:], nn + uint64(b0)
+	// The continuation bytes ran to the end of the buffer without a
+	// terminating byte, so the integer is truncated. Return an empty
+	// slice instead of slicing past the end; callers verify the
+	// remaining length and surface ErrUnexpectedSize.
+	return b[len(b):], nn + uint64(b0)
 }
 
 // appendInt appends int type to header field excluding the last byte

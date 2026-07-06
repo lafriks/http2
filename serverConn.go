@@ -465,7 +465,7 @@ loop:
 						nstrm.origType == FrameHeaders {
 
 						nstrm.SetState(StreamStateClosed)
-						closeStream(strm)
+						closeStream(nstrm)
 
 						if sc.debug {
 							sc.logger.Printf("Cancelling stream in idle state: %d\n", nstrm.ID())
@@ -626,7 +626,7 @@ func handleState(fr *FrameHeader, strm *Stream) {
 var logger = log.New(os.Stdout, "[HTTP/2] ", log.LstdFlags)
 
 var ctxPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &fasthttp.RequestCtx{}
 	},
 }
@@ -844,12 +844,12 @@ func (sc *serverConn) handleEndRequest(strm *Stream) {
 
 var (
 	copyBufPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return make([]byte, 1<<14) // max frame size 16384
 		},
 	}
 	streamWritePool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return &streamWrite{}
 		},
 	}
@@ -931,31 +931,42 @@ func (s *streamWrite) ReadFrom(r io.Reader) (num int64, err error) {
 			err = errors.New("BUG: io.Reader returned 0, nil")
 		}
 
-		if err != nil {
+		// A read may return data together with io.EOF, so the bytes must be
+		// flushed before reacting to the error.
+		eof := errors.Is(err, io.EOF)
+		num += int64(n)
+		// The stream ends when the reader is exhausted or the declared size
+		// has been reached.
+		end := eof || (s.size >= 0 && num >= s.size)
+
+		if n > 0 || end {
+			fr := AcquireFrameHeader()
+			fr.SetStream(s.strm.ID())
+
+			data := AcquireFrame(FrameData).(*Data)
+			data.SetEndStream(end)
+			data.SetPadding(false)
+			data.SetData(buf[:n])
+			fr.SetBody(data)
+
+			s.writer <- fr
+		}
+
+		if end {
+			// io.EOF is the expected, non-error end of the stream.
+			if eof {
+				err = nil
+			}
+
 			break
 		}
 
-		fr := AcquireFrameHeader()
-		fr.SetStream(s.strm.ID())
-
-		data := AcquireFrame(FrameData).(*Data)
-		data.SetEndStream(err != nil || (s.size >= 0 && num+int64(n) >= s.size))
-		data.SetPadding(false)
-		data.SetData(buf[:n])
-		fr.SetBody(data)
-
-		s.writer <- fr
-
-		num += int64(n)
-		if s.size >= 0 && num >= s.size {
+		if err != nil {
 			break
 		}
 	}
 
 	copyBufPool.Put(buf)
-	if errors.Is(err, io.EOF) {
-		return num, nil
-	}
 
 	return num, err
 }
@@ -1055,10 +1066,10 @@ func fasthttpResponseHeaders(dst *Headers, hp *HPACK, res *fasthttp.Response) {
 	// Remove the Transfer-Encoding field
 	res.Header.Del("Transfer-Encoding")
 
-	res.Header.VisitAll(func(k, v []byte) {
+	for k, v := range res.Header.All() {
 		hf.SetBytes(ToLower(k), v)
 		dst.AppendHeaderField(hp, hf, false)
-	})
+	}
 }
 
 func limitedReaderSize(r io.Reader) int64 {

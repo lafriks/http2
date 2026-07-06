@@ -76,6 +76,10 @@ func Resize(b []byte, neededLen int) []byte {
 // CutPadding cuts the padding if the frame has FlagPadded
 // from the payload and returns the new payload as byte slice.
 func CutPadding(payload []byte, length int) ([]byte, error) {
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("out of range: padded frame with empty payload")
+	}
+
 	pad := int(payload[0])
 
 	if len(payload) < length-pad-1 || length-pad < 1 {
@@ -105,7 +109,7 @@ func FastBytesToString(b []byte) string {
 }
 
 // AssertEqual checks if values are equal.
-func AssertEqual(tb testing.TB, expected, actual interface{}, description ...string) {
+func AssertEqual(tb testing.TB, expected, actual any, description ...string) {
 	tb.Helper()
 
 	if reflect.DeepEqual(expected, actual) {

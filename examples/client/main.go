@@ -62,7 +62,7 @@ func main() {
 				return
 			}
 
-			a := make(map[string]interface{})
+			a := make(map[string]any)
 			if err = json.Unmarshal(res.Body(), &a); err != nil {
 				panic(err)
 			}

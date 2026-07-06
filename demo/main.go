@@ -48,9 +48,9 @@ func newBTCTiles() fasthttp.RequestHandler {
 	xt := im.Bounds().Max.X / tileSize
 	yt := im.Bounds().Max.Y / tileSize
 	var tile [][][]byte // y -> x -> jpeg bytes
-	for yi := 0; yi < yt; yi++ {
+	for yi := range yt {
 		var row [][]byte
-		for xi := 0; xi < xt; xi++ {
+		for xi := range xt {
 			si := im.(subImager).SubImage(image.Rectangle{
 				Min: image.Point{X: xi * tileSize, Y: yi * tileSize},
 				Max: image.Point{X: (xi + 1) * tileSize, Y: (yi + 1) * tileSize},
@@ -91,8 +91,8 @@ func newBTCTiles() fasthttp.RequestHandler {
 		}
 		io.WriteString(ctx, "<p>\n")
 		cacheBust := time.Now().UnixNano()
-		for y := 0; y < yt; y++ {
-			for x := 0; x < xt; x++ {
+		for y := range yt {
+			for x := range xt {
 				fmt.Fprintf(ctx, "<img width=%d height=%d src='/tiles?x=%d&y=%d&cachebust=%d&latency=%d'>",
 					tileSize, tileSize, x, y, cacheBust, ms)
 			}
@@ -122,7 +122,7 @@ ws.onclose = function(e){
 }
 
 type WebSocketService struct {
-	connCount int64
+	connCount atomic.Int64
 	conns     sync.Map
 	once      sync.Once
 }
@@ -131,7 +131,7 @@ func (ws *WebSocketService) OnOpen(c *websocket.Conn) {
 	ws.conns.Store(c.ID(), c)
 
 	log.Printf("New connection %s. Total connections %d\n",
-		c.RemoteAddr(), atomic.AddInt64(&ws.connCount, 1))
+		c.RemoteAddr(), ws.connCount.Add(1))
 
 	ws.once.Do(ws.Run)
 }
@@ -143,7 +143,7 @@ func (ws *WebSocketService) OnClose(c *websocket.Conn, err error) {
 		log.Printf("Closing %s\n", c.RemoteAddr())
 	}
 
-	log.Printf("Connections left %d\n", atomic.AddInt64(&ws.connCount, -1))
+	log.Printf("Connections left %d\n", ws.connCount.Add(-1))
 
 	ws.conns.Delete(c.ID())
 }
@@ -157,7 +157,7 @@ func (ws *WebSocketService) OnPong(c *websocket.Conn, data []byte) {
 		return
 	}
 
-	ts := time.Now().Sub(
+	ts := time.Since(
 		time.Unix(0, int64(
 			binary.BigEndian.Uint64(data))),
 	)
@@ -177,7 +177,7 @@ func (ws *WebSocketService) Run() {
 		binary.BigEndian.PutUint64(
 			tsData[:], uint64(time.Now().UnixNano()))
 
-		ws.conns.Range(func(_, v interface{}) bool {
+		ws.conns.Range(func(_, v any) bool {
 			c := v.(*websocket.Conn)
 
 			c.Ping(tsData[:])
@@ -220,7 +220,7 @@ func main() {
 		Name:    "HTTP2 Demo",
 	}
 
-	http2.ConfigureServer(s)
+	http2.ConfigureServer(s, http2.ServerConfig{})
 
 	err := s.ListenAndServeTLS(*listenArg, *certArg, *keyArg)
 	if err != nil {
