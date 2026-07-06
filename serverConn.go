@@ -362,7 +362,11 @@ func (sc *serverConn) handleStreams() {
 	var reqTimerArmed bool
 	var openStreams int
 
-	closedStrms := make(map[uint32]struct{})
+	// closedStrms remembers the streams that already ended; the value
+	// records whether the server reset them, in which case frames the
+	// client sent before learning about the reset are ignored instead of
+	// being a connection error
+	closedStrms := make(map[uint32]bool)
 
 	closeStream := func(strm *Stream) {
 		if strm.origType == FrameHeaders {
@@ -371,7 +375,7 @@ func (sc *serverConn) handleStreams() {
 
 		strmID := strm.ID()
 
-		closedStrms[strm.ID()] = struct{}{}
+		closedStrms[strm.ID()] = strm.resetByServer
 		strms.Del(strm.ID())
 
 		ctxPool.Put(strm.ctx)
@@ -492,6 +496,7 @@ loop:
 				if sc.debug {
 					sc.logger.Printf("Stream timed out: %d\n", strm.ID())
 				}
+				strm.resetByServer = true
 				sc.writeReset(strm.ID(), StreamCanceled)
 
 				// set the state to closed in case it comes back to life later
@@ -531,20 +536,27 @@ loop:
 			if strm == nil {
 				// if the stream doesn't exist, create it
 
-				if fr.Type() == FrameResetStream {
-					// only send go away on idle stream not on an already-closed stream
-					if _, ok := closedStrms[fr.Stream()]; !ok {
-						sc.writeGoAway(fr.Stream(), ProtocolError, "RST_STREAM on idle stream")
+				if resetByServer, ok := closedStrms[fr.Stream()]; ok {
+					switch {
+					case resetByServer:
+						// RFC 9113 (section 5.1): after sending RST_STREAM the
+						// server MUST ignore the frames the client sent before
+						// learning about the reset. Their DATA still counts
+						// against the connection flow-control window.
+						if fr.Type() == FrameData {
+							sc.applyDataFlowControl(fr, false)
+						}
+					case fr.Type() == FramePriority, fr.Type() == FrameResetStream:
+						// tolerated on any closed stream
+					default:
+						sc.writeGoAway(fr.Stream(), StreamClosedError, "frame on closed stream")
 					}
 
 					continue
 				}
 
-				if _, ok := closedStrms[fr.Stream()]; ok {
-					if fr.Type() != FramePriority {
-						sc.writeGoAway(fr.Stream(), StreamClosedError, "frame on closed stream")
-					}
-
+				if fr.Type() == FrameResetStream {
+					sc.writeGoAway(fr.Stream(), ProtocolError, "RST_STREAM on idle stream")
 					continue
 				}
 
@@ -561,6 +573,9 @@ loop:
 					}
 
 					sc.writeReset(fr.Stream(), RefusedStreamError)
+					// remember the refusal: frames for this stream may
+					// already be in flight and must be ignored
+					closedStrms[fr.Stream()] = true
 
 					continue
 				}
@@ -620,6 +635,7 @@ loop:
 						nstrm.origType == FrameHeaders {
 
 						nstrm.SetState(StreamStateClosed)
+						nstrm.resetByServer = true
 						closeStream(nstrm)
 
 						if sc.debug {
@@ -645,6 +661,19 @@ loop:
 			}
 
 			handleState(fr, strm)
+
+			// a request over MaxRequestBodySize doesn't need the rest of
+			// its body: answer with the 413 right away and ask the client
+			// to stop sending with a RST_STREAM carrying NO_ERROR
+			// (RFC 9113, section 8.1.1); the frames still in flight are
+			// absorbed by the reset tolerance above
+			if strm.tooLargeBody && strm.State() == StreamStateOpen {
+				sc.handleEndRequest(strm)
+
+				strm.resetByServer = true
+				sc.writeReset(strm.ID(), NoError)
+				strm.SetState(StreamStateClosed)
+			}
 
 			switch strm.State() {
 			case StreamStateHalfClosed:
@@ -699,6 +728,29 @@ func (sc *serverConn) writeReset(strm uint32, code ErrorCode) {
 	}
 }
 
+// applyDataFlowControl accounts a received DATA frame against the receive
+// windows and replenishes them (fr.Len() covers the whole payload, padding
+// included, which is what flow control counts). It must run even for
+// payloads that get discarded: the client consumed connection window to
+// send them, and without the refill every other stream would slowly stall.
+// streamAlive controls whether the stream window is replenished too.
+func (sc *serverConn) applyDataFlowControl(fr *FrameHeader, streamAlive bool) {
+	if fr.Len() == 0 {
+		return
+	}
+
+	sc.currentWindow -= int32(fr.Len())
+
+	if streamAlive && !fr.Flags().Has(FlagEndStream) {
+		sc.updateWindow(fr.Stream(), fr.Len())
+	}
+
+	if sc.currentWindow < sc.maxWindow/2 {
+		sc.updateWindow(0, int(sc.maxWindow-sc.currentWindow))
+		sc.currentWindow = sc.maxWindow
+	}
+}
+
 // updateWindow sends a WINDOW_UPDATE to replenish the peer's send window
 // after consuming DATA. A streamID of 0 refills the connection window.
 func (sc *serverConn) updateWindow(streamID uint32, size int) {
@@ -749,6 +801,7 @@ func (sc *serverConn) writeGoAway(strm uint32, code ErrorCode, message string) {
 func (sc *serverConn) writeError(strm *Stream, err error) {
 	streamErr := Error{}
 	if !errors.As(err, &streamErr) {
+		strm.resetByServer = true
 		sc.writeReset(strm.ID(), InternalError)
 		strm.SetState(StreamStateClosed)
 		return
@@ -762,6 +815,7 @@ func (sc *serverConn) writeError(strm *Stream, err error) {
 			sc.writeGoAway(strm.ID(), streamErr.Code(), streamErr.Error())
 		}
 	case FrameResetStream:
+		strm.resetByServer = true
 		sc.writeReset(strm.ID(), streamErr.Code())
 	}
 
@@ -867,20 +921,7 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 			return NewGoAwayError(StreamClosedError, "stream closed")
 		}
 
-		if fr.Len() > 0 {
-			// fr.Len() covers the whole payload (including any padding),
-			// which is what flow control accounts for.
-			sc.currentWindow -= int32(fr.Len())
-
-			if !fr.Flags().Has(FlagEndStream) {
-				sc.updateWindow(fr.Stream(), fr.Len())
-			}
-
-			if sc.currentWindow < sc.maxWindow/2 {
-				sc.updateWindow(0, int(sc.maxWindow-sc.currentWindow))
-				sc.currentWindow = sc.maxWindow
-			}
-		}
+		sc.applyDataFlowControl(fr, true)
 
 		data := fr.Body().(*Data).Data()
 

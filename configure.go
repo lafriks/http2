@@ -88,8 +88,9 @@ func ConfigureClient(c *fasthttp.HostClient, opts ClientOpts) error {
 //     which means that by default ALL connections are open until either endpoint
 //     closes the connection.
 //   - MaxRequestBodySize: Requests with a body over the limit are answered with
-//     a 413 without reaching the handler, and the exceeding payload is not
-//     buffered. Zero means fasthttp.DefaultMaxRequestBodySize.
+//     a 413 without reaching the handler, and the stream is reset with NO_ERROR
+//     (RFC 9113, section 8.1.1) so the client can stop the upload; the exceeding
+//     payload is never buffered. Zero means fasthttp.DefaultMaxRequestBodySize.
 //   - ErrorHandler: Called for the errors the HTTP/2 server generates itself
 //     (currently fasthttp.ErrBodyTooLarge); the response it builds is sent
 //     instead of the default one.

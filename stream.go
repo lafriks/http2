@@ -58,9 +58,14 @@ type Stream struct {
 	// -1 when the request doesn't carry one
 	expectedContentLength int64
 	// tooLargeBody marks a request over the server's MaxRequestBodySize:
-	// the rest of the body is drained without buffering it, and the
-	// request is answered with 413 instead of reaching the handler
+	// it is answered with 413 without reaching the handler, and the stream
+	// is reset with NO_ERROR to stop the rest of the upload
 	tooLargeBody bool
+	// resetByServer records that the server sent a RST_STREAM for this
+	// stream: frames the client sent before learning about the reset must
+	// be ignored instead of being treated as a connection error
+	// (RFC 9113, section 5.1)
+	resetByServer bool
 }
 
 // recordViolation stores the first malformed-request violation found while
@@ -95,6 +100,7 @@ func NewStream(id uint32, win int32) *Stream {
 	strm.headerViolation = ""
 	strm.expectedContentLength = -1
 	strm.tooLargeBody = false
+	strm.resetByServer = false
 
 	return strm
 }

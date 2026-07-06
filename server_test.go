@@ -230,6 +230,106 @@ func TestMalformedRequestIsReset(t *testing.T) {
 	}
 }
 
+func TestServerResetToleratesInFlightFrames(t *testing.T) {
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				io.WriteString(ctx, "OK")
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	body := make([]byte, 3<<20)
+
+	// a malformed request pipelined with its whole body in one flush: the
+	// server resets the stream at END_HEADERS, so all the DATA arrives on
+	// an already-reset stream and must be ignored, not answered with a
+	// GOAWAY
+	h1 := makeHeadersOrdered(3, c.enc, true, false, [][2]string{
+		{":method", "POST"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+		{"X-Bad", "1"},
+		{"content-length", strconv.Itoa(len(body))},
+	})
+	c.writeFrame(h1)
+
+	if err := writeData(c.bw, h1, body); err != nil {
+		t.Fatal(err)
+	}
+	c.bw.Flush()
+
+	fr, err := c.readNext()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if fr.Type() != FrameResetStream || fr.Stream() != 3 {
+		t.Fatalf("expected reset of stream 3, got %s on %d", fr.Type(), fr.Stream())
+	}
+
+	if code := fr.Body().(*RstStream).Code(); code != ProtocolError {
+		t.Fatalf("expected ProtocolError, got %s", code)
+	}
+
+	ReleaseFrameHeader(fr)
+
+	// the connection must have survived, and a large valid upload must
+	// still complete
+	h2 := makeHeaders(5, c.enc, true, false, map[string]string{
+		string(StringAuthority): "localhost",
+		string(StringMethod):    "POST",
+		string(StringPath):      "/",
+		string(StringScheme):    "https",
+		"content-length":        strconv.Itoa(len(body)),
+	})
+	c.writeFrame(h2)
+
+	if err := writeData(c.bw, h2, body); err != nil {
+		t.Fatal(err)
+	}
+	c.bw.Flush()
+
+	for {
+		fr, err := c.readNext()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if fr.Stream() != 5 {
+			t.Fatalf("expected frame on stream 5, got %s on %d", fr.Type(), fr.Stream())
+		}
+
+		done := fr.Type() == FrameData && fr.Flags().Has(FlagEndStream)
+
+		ReleaseFrameHeader(fr)
+
+		if done {
+			break
+		}
+	}
+
+	// the DATA discarded on the reset stream must still have been counted
+	// against the connection window and refilled: the handshake grants
+	// 1<<22, and each 3MB phase (discarded and served) crosses the refill
+	// threshold once, so well over 3MB of refills must have arrived
+	if refilled := int(c.serverWindow) - 1<<22; refilled < 3<<20 {
+		t.Fatalf("expected at least %d bytes of connection window refills, got %d", 3<<20, refilled)
+	}
+}
+
 func TestRequestBodySizeLimit(t *testing.T) {
 	var handled int
 	s := &Server{
@@ -290,13 +390,17 @@ func TestRequestBodySizeLimit(t *testing.T) {
 	post := func(id uint32, contentLength int, body []byte) {
 		t.Helper()
 
-		h := makeHeaders(id, c.enc, true, false, map[string]string{
+		hs := map[string]string{
 			string(StringAuthority): "localhost",
 			string(StringMethod):    "POST",
 			string(StringPath):      "/",
 			string(StringScheme):    "https",
-			"content-length":        strconv.Itoa(contentLength),
-		})
+		}
+		if contentLength >= 0 {
+			hs["content-length"] = strconv.Itoa(contentLength)
+		}
+
+		h := makeHeaders(id, c.enc, true, false, hs)
 		c.writeFrame(h)
 
 		if err := writeData(c.bw, h, body); err != nil {
@@ -305,18 +409,41 @@ func TestRequestBodySizeLimit(t *testing.T) {
 		c.bw.Flush()
 	}
 
+	// after the early 413 the server asks the client to stop the upload
+	expectAbort := func(id uint32) {
+		t.Helper()
+
+		fr, err := c.readNext()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if fr.Type() != FrameResetStream || fr.Stream() != id {
+			t.Fatalf("expected reset of stream %d, got %s on %d", id, fr.Type(), fr.Stream())
+		}
+
+		if code := fr.Body().(*RstStream).Code(); code != NoError {
+			t.Fatalf("expected NoError reset, got %s", code)
+		}
+
+		ReleaseFrameHeader(fr)
+	}
+
 	// declared length over the limit: rejected without the handler running,
 	// even though the actual payload is small
 	post(3, 100, make([]byte, 100))
 	if status := readResponse(3); status != fasthttp.StatusRequestEntityTooLarge {
 		t.Fatalf("expected 413, got %d", status)
 	}
+	expectAbort(3)
 
-	// streamed body over the limit without a matching declaration
-	post(5, 32, make([]byte, 32))
+	// streamed body over the limit without any declared length, spanning
+	// several DATA frames: the abort happens mid-upload
+	post(5, -1, make([]byte, 40<<10))
 	if status := readResponse(5); status != fasthttp.StatusRequestEntityTooLarge {
 		t.Fatalf("expected 413, got %d", status)
 	}
+	expectAbort(5)
 
 	if handled != 0 {
 		t.Fatalf("handler ran %d times for rejected requests", handled)
