@@ -139,6 +139,8 @@ func TestH2Spec(t *testing.T) {
 		{desc: "http2/6.9.1/1"},
 		{desc: "http2/6.9.1/2"},
 		{desc: "http2/6.9.1/3"},
+		// 6.9.2/1 and 6.9.2/2 need send-side flow control (respecting a
+		// reduced SETTINGS_INITIAL_WINDOW_SIZE), which isn't implemented yet.
 		// {desc: "http2/6.9.2/1"},
 		// {desc: "http2/6.9.2/2"},
 		{desc: "http2/6.9.2/3"},
@@ -158,11 +160,8 @@ func TestH2Spec(t *testing.T) {
 		{desc: "http2/6.10/6"},
 		{desc: "http2/7/1"},
 		{desc: "http2/7/2"},
-		// About(dario): Sends a HEADERS frame that contains the header
-		//               field name in uppercase letters.
-		//               In this case, fasthttp is case-insensitive, so we can ignore it.
-		// {desc: "http2/8.1.2.1/1"},
-		// {desc: "http2/8.1.2.1/2"},
+		{desc: "http2/8.1.2.1/1"},
+		{desc: "http2/8.1.2.1/2"},
 		{desc: "http2/8.1.2.1/3"},
 		// {desc: "http2/8.1.2.1/4"},
 		// {desc: "http2/8.1.2.2/1"},
@@ -176,6 +175,9 @@ func TestH2Spec(t *testing.T) {
 		// {desc: "http2/8.1.2.3/7"},
 		// {desc: "http2/8.1.2.6/1"},
 		// {desc: "http2/8.1.2.6/2"},
+		// About(dario): Sends a HEADERS frame that contains the header
+		//               field name in uppercase letters.
+		//               In this case, fasthttp is case-insensitive, so we can ignore it.
 		// {desc: "http2/8.1.2/1"},
 		{desc: "http2/8.1/1"},
 		{desc: "http2/8.2/1"},
@@ -187,17 +189,17 @@ func TestH2Spec(t *testing.T) {
 	}
 
 	// Disable logs from h2spec
-	oldout := os.Stdout
-	os.Stdout = nil
-	t.Cleanup(func() {
-		os.Stdout = oldout
-	})
+	if os.Getenv("H2SPEC_VERBOSE") == "" {
+		oldout := os.Stdout
+		os.Stdout = nil
+		t.Cleanup(func() {
+			os.Stdout = oldout
+		})
+	}
 
 	for _, test := range testCases {
 		test := test
 		t.Run(test.desc, func(t *testing.T) {
-			t.Parallel()
-
 			conf := &config.Config{
 				Host:         "127.0.0.1",
 				Port:         port,

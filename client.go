@@ -173,5 +173,12 @@ func (cl *Client) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Request, res 
 
 	close(ch)
 
-	return false, err
+	// requests that raced with a connection shutdown are safe to retry on
+	// another connection: ErrNotAvailableStreams was never written to the
+	// wire and ErrStreamRefused means the server didn't process the stream.
+	// fasthttp still applies its own retry policy (RetryIf/idempotency) on
+	// top of this.
+	retry = errors.Is(err, ErrNotAvailableStreams) || errors.Is(err, ErrStreamRefused)
+
+	return retry, err
 }

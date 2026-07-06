@@ -17,12 +17,12 @@ var (
 	StringHTTP2         = []byte("HTTP/2")
 )
 
-func ToLower(b []byte) []byte {
+// ToLower lowercases b in place, so it must only be called on buffers
+// owned by the caller.
+func ToLower(b []byte) {
 	for i := range b {
 		b[i] |= 32
 	}
-
-	return b
 }
 
 const (

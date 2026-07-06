@@ -77,7 +77,11 @@ type Conn struct {
 	c net.Conn
 
 	br *bufio.Reader
-	bw *bufio.Writer
+	// bwMu serializes the access to bw: the writeLoop owns it most of the
+	// time, but Close writes the closing GOAWAY from whatever goroutine
+	// ends the connection first
+	bwMu sync.Mutex
+	bw   *bufio.Writer
 
 	enc *HPACK
 	dec *HPACK
@@ -291,9 +295,20 @@ func (c *Conn) doHandshake() error {
 	return err
 }
 
+func (c *Conn) getState() connState {
+	return connState(atomic.LoadInt32((*int32)(&c.state)))
+}
+
+func (c *Conn) setState(st connState) {
+	atomic.StoreInt32((*int32)(&c.state), int32(st))
+}
+
 // CanOpenStream returns whether the client will be able to open a new stream or not.
+//
+// A connection draining after a server GOAWAY can't open new streams.
 func (c *Conn) CanOpenStream() bool {
-	return atomic.LoadInt32(&c.openStreams) < int32(c.serverS.maxStreams)
+	return c.getState() == connStateOpen &&
+		atomic.LoadInt32(&c.openStreams) < int32(c.serverS.maxStreams)
 }
 
 // Closed indicates whether the connection is closed or not.
@@ -319,10 +334,12 @@ func (c *Conn) Close() error {
 
 	fr.SetBody(ga)
 
+	c.bwMu.Lock()
 	_, err := fr.WriteTo(c.bw)
 	if err == nil {
 		err = c.bw.Flush()
 	}
+	c.bwMu.Unlock()
 
 	_ = c.c.Close()
 
@@ -471,6 +488,9 @@ loop:
 }
 
 func (c *Conn) writeFrame(fr *FrameHeader) error {
+	c.bwMu.Lock()
+	defer c.bwMu.Unlock()
+
 	_, err := fr.WriteTo(c.bw)
 	if err == nil {
 		if err = c.bw.Flush(); err != nil {
@@ -511,14 +531,17 @@ func (c *Conn) readLoop() {
 			} else {
 				c.finish(r, fr.Stream(), err)
 
-				fmt.Fprintf(os.Stderr, "%s. payload=%v\n", err, fr.payload)
+				// refusals are an expected part of a server shutdown
+				if !errors.Is(err, ErrStreamRefused) {
+					fmt.Fprintf(os.Stderr, "%s. payload=%v\n", err, fr.payload)
+				}
 
 				if errors.Is(err, FlowControlError) {
 					break
 				}
 			}
 
-			if c.state == connStateClosed {
+			if c.getState() == connStateClosed {
 				if fr.Stream() == c.closeRef {
 					break
 				}
@@ -533,6 +556,9 @@ func (c *Conn) writeRequest(ctx *Ctx) error {
 	if !c.CanOpenStream() {
 		return ErrNotAvailableStreams
 	}
+
+	c.bwMu.Lock()
+	defer c.bwMu.Unlock()
 
 	req := ctx.Request
 
@@ -568,14 +594,15 @@ func (c *Conn) writeRequest(ctx *Ctx) error {
 	hf.SetBytes(StringUserAgent, req.Header.UserAgent())
 	enc.AppendHeaderField(h, hf, true)
 
-	req.Header.VisitAll(func(k, v []byte) {
+	for k, v := range req.Header.All() {
 		if bytes.EqualFold(k, StringUserAgent) {
-			return
+			continue
 		}
 
-		hf.SetBytes(ToLower(k), v)
+		hf.SetBytes(k, v)
+		ToLower(hf.KeyBytes())
 		enc.AppendHeaderField(h, hf, false)
-	})
+	}
 
 	h.SetPadding(false)
 	h.SetEndStream(!hasBody)
@@ -667,9 +694,13 @@ loop:
 				_ = c.c.Close()
 				err = ga
 			} else {
-				// wait for the streams to complete
+				// the server is shutting down (RFC 9113, section 6.8):
+				// stop opening new streams on this connection, but keep
+				// reading so the streams up to closeRef complete. A GOAWAY
+				// with the highest possible stream ID is the shutdown
+				// warning; the definitive one lowers closeRef afterwards.
 				c.closeRef = ga.stream
-				c.state = connStateClosed
+				c.setState(connStateClosed)
 			}
 
 			break loop
@@ -691,6 +722,9 @@ func (c *Conn) writePing() error {
 	ping.SetCurrentTime()
 
 	fr.SetBody(ping)
+
+	c.bwMu.Lock()
+	defer c.bwMu.Unlock()
 
 	_, err := fr.WriteTo(c.bw)
 	if err == nil {
@@ -731,11 +765,23 @@ func (c *Conn) handlePing(ping *Ping) {
 	c.out <- fr
 }
 
+// ErrStreamRefused is returned for requests whose stream the server reset
+// with REFUSED_STREAM: the request was not processed at all, so it's safe
+// to retry it even if it's not idempotent (RFC 9113, section 8.7).
+var ErrStreamRefused = errors.New("stream refused by the server")
+
 func (c *Conn) readStream(fr *FrameHeader, res *fasthttp.Response) (err error) {
 	switch fr.Type() {
 	case FrameHeaders, FrameContinuation:
 		h := fr.Body().(FrameWithHeaders)
 		err = c.readHeader(h.Headers(), res)
+	case FrameResetStream:
+		rst := fr.Body().(*RstStream)
+		if rst.Code() == RefusedStreamError {
+			err = ErrStreamRefused
+		} else {
+			err = NewResetStreamError(rst.Code(), "stream reset by the server")
+		}
 	case FrameData:
 		c.currentWindow -= int32(fr.Len())
 		currentWin := c.currentWindow

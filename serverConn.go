@@ -23,6 +23,11 @@ type connState int32
 const (
 	connStateOpen connState = iota
 	connStateClosed
+	// connStateDraining is the RFC 9113 (section 6.8) shutdown warning
+	// phase: a GOAWAY with the highest possible stream ID has been sent,
+	// but new streams are still accepted until the grace period ends and
+	// the definitive GOAWAY is sent.
+	connStateDraining
 )
 
 type serverConn struct {
@@ -74,8 +79,31 @@ type serverConn struct {
 
 	closer chan struct{}
 
+	// shutdown is closed to start a graceful shutdown of the connection:
+	// a warning GOAWAY is sent and, once the shutdown PING is acked or
+	// shutdownGracePeriod expires, the definitive GOAWAY; the connection
+	// closes once the accepted streams have been served.
+	shutdown     chan struct{}
+	shutdownOnce sync.Once
+	// shutdownGracePeriod is the longest the connection keeps accepting
+	// new streams between the two shutdown GOAWAYs; the ack of the
+	// shutdown PING ends the wait earlier. If <= 0 the definitive GOAWAY
+	// is sent right away.
+	shutdownGracePeriod time.Duration
+	// pingAck receives a token when the client acks the shutdown PING
+	pingAck chan struct{}
+
 	debug  bool
 	logger fasthttp.Logger
+}
+
+// gracefulShutdown signals the connection to send a GOAWAY, serve the
+// streams accepted so far and then close. It's safe to call it multiple
+// times and from any goroutine.
+func (sc *serverConn) gracefulShutdown() {
+	sc.shutdownOnce.Do(func() {
+		close(sc.shutdown)
+	})
 }
 
 func (sc *serverConn) closeIdleConn() {
@@ -94,6 +122,13 @@ func (sc *serverConn) Serve() error {
 	sc.closer = make(chan struct{}, 1)
 	sc.maxRequestTimer = time.NewTimer(0)
 	sc.clientWindow = int64(sc.clientS.MaxWindowSize())
+
+	// create the timer before spawning the writeLoop and readLoop
+	// goroutines: they and the timer callback read sc.pingTimer, so a
+	// later assignment would be a data race
+	if sc.pingInterval > 0 {
+		sc.pingTimer = time.AfterFunc(sc.pingInterval, sc.sendPingAndSchedule)
+	}
 
 	if sc.maxIdleTime > 0 {
 		sc.maxIdleTimer = time.AfterFunc(sc.maxIdleTime, sc.closeIdleConn)
@@ -162,6 +197,12 @@ func (sc *serverConn) close() {
 	sc.maxRequestTimer.Stop()
 }
 
+// closeConnSentinel makes the writeLoop flush the frames written so far and
+// close the connection. It lets handleStreams end the connection without
+// closing sc.writer while the readLoop might still be writing to it: closing
+// the connection ends the readLoop, and the regular teardown follows.
+var closeConnSentinel = &FrameHeader{}
+
 func (sc *serverConn) writeFrame(fr *FrameHeader) {
 	defer func() {
 		if err := recover(); err != nil {
@@ -185,6 +226,24 @@ func (sc *serverConn) writePing() {
 
 	ping := AcquireFrame(FramePing).(*Ping)
 	ping.SetCurrentTime()
+
+	fr.SetBody(ping)
+
+	sc.writeFrame(fr)
+}
+
+// shutdownPingData marks the PING sent along the shutdown warning GOAWAY,
+// so that its ack can be told apart from the keepalive PING acks.
+var shutdownPingData = [8]byte{'s', 'h', 'u', 't', 'd', 'o', 'w', 'n'}
+
+// writeShutdownPing sends the PING that follows the shutdown warning
+// GOAWAY: receiving its ack proves the client processed the GOAWAY,
+// completing the round trip RFC 9113 (section 6.8) asks to wait for.
+func (sc *serverConn) writeShutdownPing() {
+	fr := AcquireFrameHeader()
+
+	ping := AcquireFrame(FramePing).(*Ping)
+	ping.SetData(shutdownPingData[:])
 
 	fr.SetBody(ping)
 
@@ -260,6 +319,11 @@ func (sc *serverConn) readLoop() (err error) {
 			ping := fr.Body().(*Ping)
 			if !ping.IsAck() {
 				sc.handlePing(ping)
+			} else if bytes.Equal(ping.Data(), shutdownPingData[:]) {
+				select {
+				case sc.pingAck <- struct{}{}:
+				default:
+				}
 			}
 		case FrameGoAway:
 			ga := fr.Body().(*GoAway)
@@ -311,13 +375,97 @@ func (sc *serverConn) handleStreams() {
 		}
 	}
 
+	// receiving on a nil channel blocks forever, so disabling a case
+	// after its first (and only) receive is enough
+	shutdownCh := sc.shutdown
+	closerCh := sc.closer
+
+	// graceTimer delays the definitive shutdown GOAWAY to give in-flight
+	// requests the chance to still be accepted (RFC 9113, section 6.8)
+	var graceTimer *time.Timer
+	var graceTimerC <-chan time.Time
+
+	defer func() {
+		if graceTimer != nil {
+			graceTimer.Stop()
+		}
+	}()
+
+	// finalShutdown sends the definitive GOAWAY and, if all accepted
+	// streams have been served already, closes the connection. Otherwise
+	// the remaining streams are drained by the regular frame handling
+	// (the isClosing path).
+	finalShutdown := func() {
+		// an error GOAWAY might have been sent in the meantime; don't
+		// override its code, and don't raise the advertised last stream ID
+		if atomic.LoadInt32((*int32)(&sc.state)) != int32(connStateClosed) {
+			sc.writeGoAway(sc.lastID, NoError, "graceful shutdown")
+		}
+
+		for _, strm := range strms {
+			if strm.origType == FrameHeaders && strm.ID() <= sc.lastID {
+				return
+			}
+		}
+
+		sc.writeFrame(closeConnSentinel)
+	}
+
 loop:
 	for {
 		select {
-		case <-sc.closer:
-			break loop
+		case <-closerCh:
+			closerCh = nil
+			// the GOAWAY has been queued by closeIdleConn already; closing
+			// the connection through the writeLoop instead of breaking the
+			// loop lets the regular teardown close sc.writer once nothing
+			// can write to it anymore
+			sc.writeFrame(closeConnSentinel)
+		case <-shutdownCh:
+			shutdownCh = nil
+
+			if sc.shutdownGracePeriod <= 0 {
+				finalShutdown()
+				continue loop
+			}
+
+			// RFC 9113 (section 6.8): first warn the client with a GOAWAY
+			// carrying the highest possible stream ID and keep accepting
+			// new streams, so that requests racing with the shutdown are
+			// not lost; the definitive GOAWAY with the real last stream ID
+			// follows after one round trip (the shutdown PING ack), or when
+			// the grace period expires for clients that don't ack
+			sc.writeGoAwayFrame(1<<31-1, NoError, "graceful shutdown started")
+			atomic.StoreInt32((*int32)(&sc.state), int32(connStateDraining))
+
+			sc.writeShutdownPing()
+
+			graceTimer = time.NewTimer(sc.shutdownGracePeriod)
+			graceTimerC = graceTimer.C
+		case <-sc.pingAck:
+			// the shutdown PING was acked, so the warning GOAWAY has made a
+			// full round trip: any stream the client created before seeing
+			// it has been received already, no need to wait out the grace
+			// period
+			if graceTimerC != nil {
+				graceTimer.Stop()
+				graceTimerC = nil
+
+				finalShutdown()
+			}
+		case <-graceTimerC:
+			graceTimerC = nil
+
+			finalShutdown()
 		case <-sc.maxRequestTimer.C:
 			reqTimerArmed = false
+
+			// the timer is created with NewTimer(0), so its startup tick can
+			// arrive late, when streams already exist; without a request
+			// timeout every stream would be considered due and cancelled
+			if sc.maxRequestTime <= 0 {
+				continue loop
+			}
 
 			deleteUntil := 0
 			for _, strm := range strms {
@@ -516,7 +664,10 @@ loop:
 					}
 				}
 
-				break loop
+				// all streams served: flush what's pending and close the
+				// connection; readLoop then ends and the regular teardown
+				// closes this loop through sc.reader
+				sc.writeFrame(closeConnSentinel)
 			}
 		}
 	}
@@ -555,7 +706,9 @@ func (sc *serverConn) updateWindow(streamID uint32, size int) {
 	sc.writeFrame(fr)
 }
 
-func (sc *serverConn) writeGoAway(strm uint32, code ErrorCode, message string) {
+// writeGoAwayFrame only queues the GOAWAY frame, leaving the connection
+// state untouched.
+func (sc *serverConn) writeGoAwayFrame(strm uint32, code ErrorCode, message string) {
 	ga := AcquireFrame(FrameGoAway).(*GoAway)
 
 	fr := AcquireFrameHeader()
@@ -568,18 +721,22 @@ func (sc *serverConn) writeGoAway(strm uint32, code ErrorCode, message string) {
 
 	sc.writeFrame(fr)
 
-	if strm != 0 {
-		atomic.StoreUint32(&sc.closeRef, sc.lastID)
-	}
-
-	atomic.StoreInt32((*int32)(&sc.state), int32(connStateClosed))
-
 	if sc.debug {
 		sc.logger.Printf(
 			"%s: GoAway(stream=%d, code=%s): %s\n",
 			sc.c.RemoteAddr(), strm, code, message,
 		)
 	}
+}
+
+func (sc *serverConn) writeGoAway(strm uint32, code ErrorCode, message string) {
+	sc.writeGoAwayFrame(strm, code, message)
+
+	if strm != 0 {
+		atomic.StoreUint32(&sc.closeRef, sc.lastID)
+	}
+
+	atomic.StoreInt32((*int32)(&sc.state), int32(connStateClosed))
 }
 
 func (sc *serverConn) writeError(strm *Stream, err error) {
@@ -1032,13 +1189,15 @@ func (sc *serverConn) sendPingAndSchedule() {
 }
 
 func (sc *serverConn) writeLoop() {
-	if sc.pingInterval > 0 {
-		sc.pingTimer = time.AfterFunc(sc.pingInterval, sc.sendPingAndSchedule)
-	}
-
 	buffered := 0
 
 	for fr := range sc.writer {
+		if fr == closeConnSentinel {
+			_ = sc.bw.Flush()
+			_ = sc.c.Close()
+			continue
+		}
+
 		_, err := fr.WriteTo(sc.bw)
 		if err == nil && (len(sc.writer) == 0 || buffered > 10) {
 			err = sc.bw.Flush()
@@ -1096,7 +1255,8 @@ func fasthttpResponseHeaders(dst *Headers, hp *HPACK, res *fasthttp.Response) {
 	res.Header.Del("Transfer-Encoding")
 
 	for k, v := range res.Header.All() {
-		hf.SetBytes(ToLower(k), v)
+		hf.SetBytes(k, v)
+		ToLower(hf.KeyBytes())
 		dst.AppendHeaderField(hp, hf, false)
 	}
 }

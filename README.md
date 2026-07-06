@@ -39,6 +39,25 @@ func main() {
 }
 ```
 
+### Graceful shutdown
+
+[ConfigureServer](https://pkg.go.dev/github.com/lafriks/http2#ConfigureServer) returns an
+`*http2.Server` whose `Shutdown` drains the HTTP/2 connections following the
+RFC 9113 GOAWAY sequence: in-flight and just-created streams are still served,
+new streams are refused with a retry-safe error. Call it before shutting down
+the fasthttp server, which otherwise waits for the HTTP/2 connections without
+being able to close them:
+
+```go
+h2s := http2.ConfigureServer(s, http2.ServerConfig{})
+
+// ... on shutdown signal:
+h2s.Shutdown(ctx) // drain the HTTP/2 connections
+s.Shutdown()      // then stop the fasthttp server
+```
+
+See [examples/simple](./examples/simple/main.go) for a complete example.
+
 ## How to use the client?
 
 The HTTP/2 client only works with the HostClient.

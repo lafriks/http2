@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/lafriks/http2"
@@ -29,13 +33,32 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	http2.ConfigureServer(s, http2.ServerConfig{
+	h2s := http2.ConfigureServer(s, http2.ServerConfig{
 		Debug: *debug,
 	})
 
-	err = s.ListenAndServeTLS(":8443", "", "")
-	if err != nil {
-		log.Fatalln(err)
+	go func() {
+		if err := s.ListenAndServeTLS(":8443", "", ""); err != nil {
+			log.Fatalln(err)
+		}
+	}()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	<-sig
+
+	// drain the HTTP/2 connections first (GOAWAY + serving the accepted
+	// streams); fasthttp's Shutdown would otherwise wait for them without
+	// being able to close them
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
+
+	if err := h2s.Shutdown(ctx); err != nil {
+		log.Println("HTTP/2 shutdown:", err)
+	}
+
+	if err := s.Shutdown(); err != nil {
+		log.Println("shutdown:", err)
 	}
 }
 
