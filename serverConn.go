@@ -69,6 +69,13 @@ type serverConn struct {
 	// Therefore, a client that didn't send a request for more than `maxIdleTime` will see it's connection closed.
 	maxIdleTime time.Duration
 
+	// maxRequestBodySize limits how much of a request body is buffered,
+	// mirroring fasthttp.Server.MaxRequestBodySize
+	maxRequestBodySize int
+	// errorHandler mirrors fasthttp.Server.ErrorHandler for the errors
+	// the HTTP/2 server generates itself (fasthttp.ErrBodyTooLarge)
+	errorHandler func(*fasthttp.RequestCtx, error)
+
 	st      Settings
 	clientS Settings
 
@@ -840,6 +847,16 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 
 			// calling req.URI() triggers a URL parsing, so because of that we need to delay the URL parsing.
 			strm.ctx.Request.URI().SetSchemeBytes(strm.scheme)
+
+			if err := validateRequestHeaders(strm, fr); err != nil {
+				return err
+			}
+
+			// a declared length over the limit rejects the request before
+			// buffering anything
+			if strm.expectedContentLength > int64(sc.maxRequestBodySize) {
+				strm.tooLargeBody = true
+			}
 		}
 	case FrameData:
 		if !strm.headersFinished {
@@ -865,8 +882,30 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 			}
 		}
 
-		strm.ctx.Request.AppendBody(
-			fr.Body().(*Data).Data())
+		data := fr.Body().(*Data).Data()
+
+		switch {
+		case strm.tooLargeBody:
+			// drain the rest of the body without buffering it; the
+			// flow-control accounting above keeps the windows correct
+		case len(strm.ctx.Request.Body())+len(data) > sc.maxRequestBodySize:
+			strm.tooLargeBody = true
+			// release what has been buffered so far: the request is
+			// going to be rejected without reaching the handler
+			strm.ctx.Request.ResetBody()
+		default:
+			strm.ctx.Request.AppendBody(data)
+		}
+
+		// RFC 9113 (section 8.1.1): a request whose content-length doesn't
+		// match the sum of the DATA payloads is malformed
+		if fr.Flags().Has(FlagEndStream) &&
+			!strm.tooLargeBody &&
+			strm.expectedContentLength >= 0 &&
+			strm.expectedContentLength != int64(len(strm.ctx.Request.Body())) {
+
+			return NewResetStreamError(ProtocolError, "content-length header field does not match the DATA payload")
+		}
 	case FrameResetStream:
 		if strm.State() == StreamStateIdle {
 			return NewGoAwayError(ProtocolError, "RST_STREAM on idle stream")
@@ -933,47 +972,175 @@ func (sc *serverConn) handleHeaderFrame(strm *Stream, fr *FrameHeader) error {
 			break
 		}
 
-		k, v := hf.KeyBytes(), hf.ValueBytes()
-		if !hf.IsPseudo() &&
-			!bytes.Equal(k, StringUserAgent) &&
-			!bytes.Equal(k, StringContentType) {
+		fieldsProcessed++
 
-			req.Header.AddBytesKV(k, v)
+		k, v := hf.KeyBytes(), hf.ValueBytes()
+
+		if hf.IsPseudo() {
+			if err = parsePseudoField(strm, req, k[1:], v); err != nil {
+				break
+			}
+
 			continue
 		}
 
-		if hf.IsPseudo() {
-			k = k[1:]
-		}
+		// a violation makes the request malformed, but the block keeps
+		// being decoded so the HPACK tables stay synchronized; the stream
+		// is reset once the block ends
+		strm.regularHeadersSeen = true
+		validateRegularField(strm, k, v)
 
-		switch k[0] {
-		case 'm': // method
-			req.Header.SetMethodBytes(v)
-		case 'p': // path
-			req.Header.SetRequestURIBytes(v)
-		case 's': // scheme
-			if !bytes.Equal(k, StringScheme[1:]) {
-				return NewGoAwayError(ProtocolError, "invalid pseudoheader")
-			}
-
-			strm.scheme = append(strm.scheme[:0], v...)
-		case 'a': // authority
-			req.Header.SetHostBytes(v)
-			req.Header.AddBytesV("Host", v)
-		case 'u': // user-agent
+		switch {
+		case bytes.Equal(k, StringUserAgent):
 			req.Header.SetUserAgentBytes(v)
-		case 'c': // content-type
+		case bytes.Equal(k, StringContentType):
 			req.Header.SetContentTypeBytes(v)
 		default:
-			return NewGoAwayError(ProtocolError, fmt.Sprintf("unknown header field %s", k))
+			req.Header.AddBytesKV(k, v)
 		}
-
-		fieldsProcessed++
 	}
 
 	strm.headerBlockNum++
 
 	return err
+}
+
+const (
+	pseudoMethod = uint8(1) << iota
+	pseudoScheme
+	pseudoPath
+	pseudoAuthority
+)
+
+// parsePseudoField handles a request pseudo-header field (RFC 9113,
+// section 8.3.1). k comes without the leading ':'.
+func parsePseudoField(strm *Stream, req *fasthttp.Request, k, v []byte) error {
+	if strm.regularHeadersSeen {
+		strm.recordViolation("pseudo-header field after a regular header field")
+	}
+
+	var seen uint8
+
+	switch {
+	case bytes.Equal(k, StringMethod[1:]):
+		seen = pseudoMethod
+		req.Header.SetMethodBytes(v)
+	case bytes.Equal(k, StringPath[1:]):
+		seen = pseudoPath
+		if len(v) == 0 {
+			strm.recordViolation("empty :path pseudo-header field")
+		}
+
+		req.Header.SetRequestURIBytes(v)
+	case bytes.Equal(k, StringScheme[1:]):
+		seen = pseudoScheme
+		strm.scheme = append(strm.scheme[:0], v...)
+	case bytes.Equal(k, StringAuthority[1:]):
+		seen = pseudoAuthority
+		req.Header.SetHostBytes(v)
+		req.Header.AddBytesV("Host", v)
+	default:
+		return NewGoAwayError(ProtocolError, fmt.Sprintf("unknown header field %s", k))
+	}
+
+	if strm.pseudoSeen&seen != 0 {
+		strm.recordViolation("duplicated pseudo-header field")
+	}
+
+	strm.pseudoSeen |= seen
+
+	return nil
+}
+
+// validateRegularField checks a regular header field for the
+// malformed-request conditions of RFC 9113, sections 8.2.1 to 8.2.2.
+func validateRegularField(strm *Stream, k, v []byte) {
+	if len(k) == 0 {
+		strm.recordViolation("empty header field name")
+		return
+	}
+
+	for _, c := range k {
+		if 'A' <= c && c <= 'Z' {
+			strm.recordViolation("uppercase header field name")
+			return
+		}
+	}
+
+	// the connection-specific header fields forbidden by section 8.2.2 and
+	// the fields with checked values all start with one of these letters,
+	// so most fields are done after the switch on the first byte
+	switch k[0] {
+	case 'c':
+		if string(k) == "connection" {
+			strm.recordViolation("connection-specific header field")
+		} else if bytes.Equal(k, StringContentLength) {
+			n, err := fasthttp.ParseUint(v)
+			if err != nil {
+				strm.recordViolation("invalid content-length header field")
+			} else if strm.expectedContentLength >= 0 && strm.expectedContentLength != int64(n) {
+				strm.recordViolation("duplicated content-length header field")
+			} else {
+				strm.expectedContentLength = int64(n)
+			}
+		}
+	case 'k':
+		if string(k) == "keep-alive" {
+			strm.recordViolation("connection-specific header field")
+		}
+	case 'p':
+		if string(k) == "proxy-connection" {
+			strm.recordViolation("connection-specific header field")
+		}
+	case 't':
+		if bytes.Equal(k, StringTE) {
+			if !bytes.EqualFold(v, StringTrailers) {
+				strm.recordViolation(`te header field with value other than "trailers"`)
+			}
+		} else if string(k) == "transfer-encoding" {
+			strm.recordViolation("connection-specific header field")
+		}
+	case 'u':
+		if string(k) == "upgrade" {
+			strm.recordViolation("connection-specific header field")
+		}
+	}
+}
+
+// validateRequestHeaders enforces the rules that can only be checked once
+// the header block ends: mandatory pseudo-header fields (RFC 9113, section
+// 8.3.1) and a content-length coherent with END_STREAM (section 8.1.1).
+// Violations recorded while decoding are surfaced here as well, now that
+// the HPACK state is synchronized: the malformed request resets the stream
+// instead of killing the connection.
+func validateRequestHeaders(strm *Stream, fr *FrameHeader) error {
+	if strm.headerViolation == "" {
+		switch {
+		case strm.pseudoSeen&pseudoMethod == 0:
+			strm.recordViolation("missing :method pseudo-header field")
+		case bytes.Equal(strm.ctx.Request.Header.Method(), StringCONNECT):
+			// CONNECT requests carry only :method and :authority
+			if strm.pseudoSeen&(pseudoScheme|pseudoPath) != 0 {
+				strm.recordViolation(":scheme or :path pseudo-header field on a CONNECT request")
+			} else if strm.pseudoSeen&pseudoAuthority == 0 {
+				strm.recordViolation("missing :authority pseudo-header field on a CONNECT request")
+			}
+		case strm.pseudoSeen&pseudoScheme == 0:
+			strm.recordViolation("missing :scheme pseudo-header field")
+		case strm.pseudoSeen&pseudoPath == 0:
+			strm.recordViolation("missing :path pseudo-header field")
+		}
+
+		if fr.Flags().Has(FlagEndStream) && strm.expectedContentLength > 0 {
+			strm.recordViolation("content-length header field on a request without payload")
+		}
+	}
+
+	if strm.headerViolation != "" {
+		return NewResetStreamError(ProtocolError, strm.headerViolation)
+	}
+
+	return nil
 }
 
 func (sc *serverConn) verifyState(strm *Stream, fr *FrameHeader) error {
@@ -997,7 +1164,17 @@ func (sc *serverConn) handleEndRequest(strm *Stream) {
 	ctx := strm.ctx
 	ctx.Request.Header.SetProtocolBytes(StringHTTP2)
 
-	sc.h(ctx)
+	if strm.tooLargeBody {
+		// same as fasthttp: the error goes through the configured
+		// ErrorHandler, which can customize the response
+		if sc.errorHandler != nil {
+			sc.errorHandler(ctx, fasthttp.ErrBodyTooLarge)
+		} else {
+			ctx.Error(fasthttp.ErrBodyTooLarge.Error(), fasthttp.StatusRequestEntityTooLarge)
+		}
+	} else {
+		sc.h(ctx)
+	}
 
 	hasBody := ctx.Response.IsBodyStream() || len(ctx.Response.Body()) > 0
 

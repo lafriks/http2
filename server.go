@@ -149,14 +149,21 @@ func (s *Server) ServeConn(c net.Conn) error {
 		return errors.New("wrong preface")
 	}
 
+	maxRequestBodySize := s.s.MaxRequestBodySize
+	if maxRequestBodySize <= 0 {
+		maxRequestBodySize = fasthttp.DefaultMaxRequestBodySize
+	}
+
 	sc := &serverConn{
-		c:              c,
-		h:              s.s.Handler,
-		br:             bufio.NewReader(c),
-		bw:             bufio.NewWriterSize(c, 1<<14*10),
-		lastID:         0,
-		writer:         make(chan *FrameHeader, 128),
-		reader:         make(chan *FrameHeader, 128),
+		c:                   c,
+		h:                   s.s.Handler,
+		br:                  bufio.NewReader(c),
+		bw:                  bufio.NewWriterSize(c, 1<<14*10),
+		lastID:              0,
+		maxRequestBodySize:  maxRequestBodySize,
+		errorHandler:        s.s.ErrorHandler,
+		writer:              make(chan *FrameHeader, 128),
+		reader:              make(chan *FrameHeader, 128),
 		maxRequestTime:      s.s.ReadTimeout,
 		maxIdleTime:         s.s.IdleTimeout,
 		pingInterval:        s.cnf.PingInterval,

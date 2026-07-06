@@ -52,9 +52,24 @@ func makeHeaders(id uint32, enc *HPACK, endHeaders, endStream bool, hs map[strin
 
 	hf := AcquireHeaderField()
 
+	// pseudo-header fields must precede the regular ones, and hs is a map
+	// with random iteration order
 	for k, v := range hs {
+		if k[0] != ':' {
+			continue
+		}
+
 		hf.Set(k, v)
-		enc.AppendHeaderField(h, hf, k[0] == ':')
+		enc.AppendHeaderField(h, hf, true)
+	}
+
+	for k, v := range hs {
+		if k[0] == ':' {
+			continue
+		}
+
+		hf.Set(k, v)
+		enc.AppendHeaderField(h, hf, false)
 	}
 
 	h.SetPadding(false)
@@ -62,6 +77,261 @@ func makeHeaders(id uint32, enc *HPACK, endHeaders, endStream bool, hs map[strin
 	h.SetEndHeaders(endHeaders)
 
 	return fr
+}
+
+// makeHeadersOrdered is like makeHeaders but preserves the field order, for
+// tests where the order is the point.
+func makeHeadersOrdered(id uint32, enc *HPACK, endHeaders, endStream bool, hs [][2]string) *FrameHeader {
+	fr := AcquireFrameHeader()
+
+	fr.SetStream(id)
+
+	h := AcquireFrame(FrameHeaders).(*Headers)
+	fr.SetBody(h)
+
+	hf := AcquireHeaderField()
+
+	for _, kv := range hs {
+		hf.Set(kv[0], kv[1])
+		enc.AppendHeaderField(h, hf, kv[0][0] == ':')
+	}
+
+	h.SetPadding(false)
+	h.SetEndStream(endStream)
+	h.SetEndHeaders(endHeaders)
+
+	return fr
+}
+
+func TestMalformedRequestIsReset(t *testing.T) {
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				io.WriteString(ctx, "OK")
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name    string
+		headers [][2]string
+	}{
+		{"uppercase field name", [][2]string{
+			{":method", "GET"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+			{"X-Custom", "1"},
+		}},
+		{"connection-specific field", [][2]string{
+			{":method", "GET"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+			{"connection", "keep-alive"},
+		}},
+		{"te other than trailers", [][2]string{
+			{":method", "GET"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+			{"te", "gzip"},
+		}},
+		{"pseudo-header after regular field", [][2]string{
+			{":method", "GET"}, {":path", "/"}, {":scheme", "https"},
+			{"x-custom", "1"},
+			{":authority", "localhost"},
+		}},
+		{"missing :method", [][2]string{
+			{":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+		}},
+		{"empty :path", [][2]string{
+			{":method", "GET"}, {":path", ""}, {":scheme", "https"}, {":authority", "localhost"},
+		}},
+		{"duplicated :path", [][2]string{
+			{":method", "GET"}, {":path", "/"}, {":path", "/other"}, {":scheme", "https"}, {":authority", "localhost"},
+		}},
+		{"content-length without payload", [][2]string{
+			{":method", "POST"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+			{"content-length", "5"},
+		}},
+	}
+
+	id := uint32(3)
+
+	for _, tc := range cases {
+		c.writeFrame(makeHeadersOrdered(id, c.enc, true, true, tc.headers))
+
+		fr, err := c.readNext()
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+
+		if fr.Type() != FrameResetStream || fr.Stream() != id {
+			t.Fatalf("%s: expected reset of stream %d, got %s on %d", tc.name, id, fr.Type(), fr.Stream())
+		}
+
+		if code := fr.Body().(*RstStream).Code(); code != ProtocolError {
+			t.Fatalf("%s: expected ProtocolError, got %s", tc.name, code)
+		}
+
+		ReleaseFrameHeader(fr)
+
+		id += 2
+	}
+
+	// content-length not matching the DATA payload
+	h1 := makeHeadersOrdered(id, c.enc, true, false, [][2]string{
+		{":method", "POST"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+		{"content-length", "5"},
+	})
+	c.writeFrame(h1)
+
+	if err := writeData(c.bw, h1, []byte("xx")); err != nil {
+		t.Fatal(err)
+	}
+	c.bw.Flush()
+
+	fr, err := c.readNext()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if fr.Type() != FrameResetStream || fr.Body().(*RstStream).Code() != ProtocolError {
+		t.Fatalf("content-length mismatch: expected ProtocolError reset, got %s", fr.Type())
+	}
+
+	ReleaseFrameHeader(fr)
+
+	id += 2
+
+	// the connection and its HPACK state must survive the malformed
+	// requests: a valid one still gets served
+	c.writeFrame(makeHeadersOrdered(id, c.enc, true, true, [][2]string{
+		{":method", "GET"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+	}))
+
+	for _, expect := range []FrameType{FrameHeaders, FrameData} {
+		fr, err := c.readNext()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if fr.Type() != expect || fr.Stream() != id {
+			t.Fatalf("expected %s on stream %d, got %s on %d", expect, id, fr.Type(), fr.Stream())
+		}
+
+		ReleaseFrameHeader(fr)
+	}
+}
+
+func TestRequestBodySizeLimit(t *testing.T) {
+	var handled int
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				handled++
+				io.WriteString(ctx, "OK")
+			},
+			MaxRequestBodySize: 16,
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	// readResponse reads HEADERS(+DATA) for the stream and returns the status
+	readResponse := func(id uint32) int {
+		t.Helper()
+
+		res := fasthttp.AcquireResponse()
+		defer fasthttp.ReleaseResponse(res)
+
+		for {
+			fr, err := c.readNext()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if fr.Stream() != id {
+				t.Fatalf("expected frame on stream %d, got %s on %d", id, fr.Type(), fr.Stream())
+			}
+
+			end := fr.Flags().Has(FlagEndStream)
+
+			if err := c.readStream(fr, res); err != nil {
+				t.Fatal(err)
+			}
+
+			ReleaseFrameHeader(fr)
+
+			if end {
+				return res.StatusCode()
+			}
+		}
+	}
+
+	post := func(id uint32, contentLength int, body []byte) {
+		t.Helper()
+
+		h := makeHeaders(id, c.enc, true, false, map[string]string{
+			string(StringAuthority): "localhost",
+			string(StringMethod):    "POST",
+			string(StringPath):      "/",
+			string(StringScheme):    "https",
+			"content-length":        strconv.Itoa(contentLength),
+		})
+		c.writeFrame(h)
+
+		if err := writeData(c.bw, h, body); err != nil {
+			t.Fatal(err)
+		}
+		c.bw.Flush()
+	}
+
+	// declared length over the limit: rejected without the handler running,
+	// even though the actual payload is small
+	post(3, 100, make([]byte, 100))
+	if status := readResponse(3); status != fasthttp.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d", status)
+	}
+
+	// streamed body over the limit without a matching declaration
+	post(5, 32, make([]byte, 32))
+	if status := readResponse(5); status != fasthttp.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d", status)
+	}
+
+	if handled != 0 {
+		t.Fatalf("handler ran %d times for rejected requests", handled)
+	}
+
+	// a body exactly at the limit passes, and the connection survived the
+	// rejections
+	post(7, 16, make([]byte, 16))
+	if status := readResponse(7); status != fasthttp.StatusOK {
+		t.Fatalf("expected 200, got %d", status)
+	}
+
+	if handled != 1 {
+		t.Fatalf("expected the handler to run once, ran %d times", handled)
+	}
 }
 
 func TestIssue52(t *testing.T) {
@@ -97,14 +367,14 @@ func testIssue52(t *testing.T) {
 		string(StringMethod):    "POST",
 		string(StringPath):      "/hello/world",
 		string(StringScheme):    "https",
-		"Content-Length":        strconv.Itoa(len(msg)),
+		"content-length":        strconv.Itoa(len(msg)),
 	})
 	h2 := makeHeaders(9, c.enc, true, false, map[string]string{
 		string(StringAuthority): "localhost",
 		string(StringMethod):    "POST",
 		string(StringPath):      "/hello/world",
 		string(StringScheme):    "https",
-		"Content-Length":        strconv.Itoa(len(msg)),
+		"content-length":        strconv.Itoa(len(msg)),
 	})
 	h3 := makeHeaders(7, c.enc, true, true, map[string]string{
 		string(StringAuthority): "localhost",
@@ -198,21 +468,21 @@ func TestIssue27(t *testing.T) {
 		string(StringMethod):    "POST",
 		string(StringPath):      "/hello/world",
 		string(StringScheme):    "https",
-		"Content-Length":        strconv.Itoa(len(msg)),
+		"content-length":        strconv.Itoa(len(msg)),
 	})
 	h2 := makeHeaders(5, c.enc, true, false, map[string]string{
 		string(StringAuthority): "localhost",
 		string(StringMethod):    "POST",
 		string(StringPath):      "/hello/world",
 		string(StringScheme):    "https",
-		"Content-Length":        strconv.Itoa(len(msg)),
+		"content-length":        strconv.Itoa(len(msg)),
 	})
 	h3 := makeHeaders(7, c.enc, false, false, map[string]string{
 		string(StringAuthority): "localhost",
 		string(StringMethod):    "GET",
 		string(StringPath):      "/hello/world",
 		string(StringScheme):    "https",
-		"Content-Length":        strconv.Itoa(len(msg)),
+		"content-length":        strconv.Itoa(len(msg)),
 	})
 
 	c.writeFrame(h1)
@@ -280,7 +550,7 @@ func TestUploadReplenishesWindow(t *testing.T) {
 		string(StringMethod):    "POST",
 		string(StringPath):      "/upload",
 		string(StringScheme):    "https",
-		"Content-Length":        strconv.Itoa(len(body)),
+		"content-length":        strconv.Itoa(len(body)),
 	})
 
 	writeErr := make(chan error, 1)
@@ -467,7 +737,7 @@ func TestShutdownDrainsStreams(t *testing.T) {
 		string(StringMethod):    "POST",
 		string(StringPath):      "/hello/world",
 		string(StringScheme):    "https",
-		"Content-Length":        strconv.Itoa(len(msg)),
+		"content-length":        strconv.Itoa(len(msg)),
 	})
 	c.writeFrame(h1)
 
@@ -880,7 +1150,7 @@ func TestShutdownForceClose(t *testing.T) {
 		string(StringMethod):    "POST",
 		string(StringPath):      "/hello/world",
 		string(StringScheme):    "https",
-		"Content-Length":        "11",
+		"content-length":        "11",
 	})
 	c.writeFrame(h1)
 

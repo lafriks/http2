@@ -49,6 +49,27 @@ type Stream struct {
 	origType        FrameType
 	startedAt       time.Time
 	headersFinished bool
+
+	// header validation state (RFC 9113, sections 8.1 to 8.3)
+	pseudoSeen         uint8
+	regularHeadersSeen bool
+	headerViolation    string
+	// expectedContentLength is the content-length header value,
+	// -1 when the request doesn't carry one
+	expectedContentLength int64
+	// tooLargeBody marks a request over the server's MaxRequestBodySize:
+	// the rest of the body is drained without buffering it, and the
+	// request is answered with 413 instead of reaching the handler
+	tooLargeBody bool
+}
+
+// recordViolation stores the first malformed-request violation found while
+// decoding a header block. The block keeps being decoded so the HPACK state
+// stays synchronized; the stream is reset once the block ends.
+func (s *Stream) recordViolation(msg string) {
+	if s.headerViolation == "" {
+		s.headerViolation = msg
+	}
 }
 
 var streamPool = sync.Pool{
@@ -69,6 +90,11 @@ func NewStream(id uint32, win int32) *Stream {
 	strm.scheme = []byte("https")
 	strm.origType = 0
 	strm.headerBlockNum = 0
+	strm.pseudoSeen = 0
+	strm.regularHeadersSeen = false
+	strm.headerViolation = ""
+	strm.expectedContentLength = -1
+	strm.tooLargeBody = false
 
 	return strm
 }

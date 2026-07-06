@@ -14,7 +14,10 @@ var (
 	StringGET           = []byte("GET")
 	StringHEAD          = []byte("HEAD")
 	StringPOST          = []byte("POST")
+	StringCONNECT       = []byte("CONNECT")
 	StringHTTP2         = []byte("HTTP/2")
+	StringTE            = []byte("te")
+	StringTrailers      = []byte("trailers")
 )
 
 // ToLower lowercases b in place, so it must only be called on buffers

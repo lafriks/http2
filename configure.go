@@ -87,6 +87,12 @@ func ConfigureClient(c *fasthttp.HostClient, opts ClientOpts) error {
 //     To disable the option you can set it to zero. No value is taken by default,
 //     which means that by default ALL connections are open until either endpoint
 //     closes the connection.
+//   - MaxRequestBodySize: Requests with a body over the limit are answered with
+//     a 413 without reaching the handler, and the exceeding payload is not
+//     buffered. Zero means fasthttp.DefaultMaxRequestBodySize.
+//   - ErrorHandler: Called for the errors the HTTP/2 server generates itself
+//     (currently fasthttp.ErrBodyTooLarge); the response it builds is sent
+//     instead of the default one.
 func ConfigureServer(s *fasthttp.Server, cnf ServerConfig) *Server {
 	cnf.defaults()
 
