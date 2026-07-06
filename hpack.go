@@ -87,6 +87,7 @@ func (hp *HPACK) Reset() {
 	hp.maxTableSize = defaultHeaderTableSize
 	hp.maxTableSizeSettings = defaultHeaderTableSize
 	hp.DisableCompression = false
+	hp.DisableDynamicTable = false
 }
 
 // SetMaxTableSize sets the maximum dynamic table size.
