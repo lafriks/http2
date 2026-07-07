@@ -88,13 +88,29 @@ type Conn struct {
 
 	nextID uint32
 
-	serverWindow       int32
-	serverStreamWindow int32
+	// sendMu guards the send-side flow-control state: serverWindow,
+	// serverInitialWindow and every request's stream window delta
+	// (Ctx.sendWindow). sendCond wakes the body senders blocked on an
+	// exhausted window.
+	sendMu   sync.Mutex
+	sendCond sync.Cond
+	// serverWindow is the connection-level send window: what the server
+	// can still receive. It starts at 65535 (RFC 9113, section 6.9.2),
+	// grows with the server's WINDOW_UPDATEs and shrinks with the DATA
+	// sent.
+	serverWindow int64
+	// serverInitialWindow is the server's SETTINGS_INITIAL_WINDOW_SIZE:
+	// the base of every stream's send window
+	serverInitialWindow int64
 
 	maxWindow     int32
 	currentWindow int32
 
-	openStreams int32
+	// closeCh unblocks the body senders parked on c.out when the
+	// connection dies
+	closeCh chan struct{}
+
+	openStreams atomic.Int32
 
 	current Settings
 	serverS Settings
@@ -109,7 +125,9 @@ type Conn struct {
 
 	pingInterval time.Duration
 
-	unacks      int
+	// unacks counts the PINGs awaiting their ack; written by both the
+	// write loop (sending) and the read loop (acks)
+	unacks      atomic.Int32
 	disableAcks bool
 
 	lastErr      error
@@ -122,20 +140,25 @@ type Conn struct {
 // To start using the connection you need to call Handshake.
 func NewConn(c net.Conn, opts ConnOpts) *Conn {
 	nc := &Conn{
-		c:             c,
-		br:            bufio.NewReaderSize(c, 4096),
-		bw:            bufio.NewWriterSize(c, maxFrameSize),
-		enc:           AcquireHPACK(),
-		dec:           AcquireHPACK(),
-		nextID:        1,
-		maxWindow:     1 << 20,
-		currentWindow: 1 << 20,
-		in:            make(chan *Ctx, 128),
-		out:           make(chan *FrameHeader, 128),
-		pingInterval:  opts.PingInterval,
-		disableAcks:   opts.DisablePingChecking,
-		onDisconnect:  opts.OnDisconnect,
+		c:                   c,
+		br:                  bufio.NewReaderSize(c, 4096),
+		bw:                  bufio.NewWriterSize(c, maxFrameSize),
+		enc:                 AcquireHPACK(),
+		dec:                 AcquireHPACK(),
+		nextID:              1,
+		maxWindow:           1 << 20,
+		currentWindow:       1 << 20,
+		serverWindow:        65535,
+		serverInitialWindow: 65535,
+		in:                  make(chan *Ctx, 128),
+		out:                 make(chan *FrameHeader, 128),
+		closeCh:             make(chan struct{}),
+		pingInterval:        opts.PingInterval,
+		disableAcks:         opts.DisablePingChecking,
+		onDisconnect:        opts.OnDisconnect,
 	}
+
+	nc.sendCond.L = &nc.sendMu
 
 	nc.current.SetMaxWindowSize(1 << 20)
 	nc.current.SetPush(false)
@@ -265,7 +288,10 @@ func (c *Conn) doHandshake() error {
 		if !st.IsAck() {
 			st.CopyTo(&c.serverS)
 
-			c.serverStreamWindow += int32(c.serverS.MaxWindowSize())
+			c.sendMu.Lock()
+			c.serverInitialWindow = int64(c.serverS.MaxWindowSize())
+			c.sendMu.Unlock()
+
 			if st.HeaderTableSize() <= defaultHeaderTableSize {
 				c.enc.SetMaxTableSize(st.HeaderTableSize())
 			}
@@ -308,7 +334,7 @@ func (c *Conn) setState(st connState) {
 // A connection draining after a server GOAWAY can't open new streams.
 func (c *Conn) CanOpenStream() bool {
 	return c.getState() == connStateOpen &&
-		atomic.LoadInt32(&c.openStreams) < int32(c.serverS.maxStreams)
+		c.openStreams.Load() < int32(c.serverS.maxStreams)
 }
 
 // Closed indicates whether the connection is closed or not.
@@ -324,6 +350,12 @@ func (c *Conn) Close() error {
 	}
 
 	close(c.in)
+	close(c.closeCh)
+
+	// unblock the body senders waiting for window
+	c.sendMu.Lock()
+	c.sendCond.Broadcast()
+	c.sendMu.Unlock()
 
 	fr := AcquireFrameHeader()
 	defer ReleaseFrameHeader(fr)
@@ -373,16 +405,25 @@ func (c *Conn) Cancel(ctx *Ctx) error {
 }
 
 func (c *Conn) cancel(ctx *Ctx) {
+	id := atomic.LoadUint32(&ctx.streamID)
+
 	h := AcquireFrameHeader()
-	h.SetStream( // TODO: use atomic here??
-		atomic.LoadUint32(&ctx.streamID))
+	h.SetStream(id)
 
 	fr := AcquireFrame(FrameResetStream).(*RstStream)
 	fr.SetCode(StreamCanceled)
 
 	h.SetBody(fr)
 
-	c.out <- h
+	select {
+	case c.out <- h:
+	case <-c.closeCh:
+		ReleaseFrameHeader(h)
+	}
+
+	// resolve the request: the server won't reply to the reset stream.
+	// A request that already finished makes this a no-op.
+	c.finish(ctx, id, ErrRequestCanceled)
 }
 
 type WriteError struct {
@@ -428,7 +469,7 @@ func (c *Conn) writeLoop() {
 
 		c.reqQueued.Range(func(_, v any) bool {
 			r := v.(*Ctx)
-			r.resolve(lastErr)
+			c.resolveCtx(r, lastErr)
 
 			return true
 		})
@@ -451,7 +492,7 @@ loop:
 
 			err := c.writeRequest(ctx)
 			if err != nil {
-				ctx.resolve(err)
+				c.resolveCtx(ctx, err)
 
 				if errors.Is(err, ErrNotAvailableStreams) {
 					continue
@@ -480,7 +521,7 @@ loop:
 			}
 		}
 
-		if !c.disableAcks && c.unacks >= 3 {
+		if !c.disableAcks && c.unacks.Load() >= 3 {
 			lastErr = ErrTimeout
 			break loop
 		}
@@ -502,11 +543,39 @@ func (c *Conn) writeFrame(fr *FrameHeader) error {
 }
 
 func (c *Conn) finish(r *Ctx, stream uint32, err error) {
-	atomic.AddInt32(&c.openStreams, -1)
+	// the request can finish from the readLoop, its body sender or a
+	// cancel: only the first one counts
+	if _, ok := c.reqQueued.LoadAndDelete(stream); !ok {
+		return
+	}
+
+	c.openStreams.Add(-1)
+
+	c.resolveCtx(r, err)
+}
+
+// resolveCtx delivers the request's outcome to the caller. While a body
+// sender still holds the Request the delivery is deferred to the sender's
+// exit: the caller recycles the request as soon as it resolves.
+func (c *Conn) resolveCtx(r *Ctx, err error) {
+	c.sendMu.Lock()
+
+	if r.bodySending {
+		if !r.finishPending {
+			r.finishPending = true
+			r.finishErr = err
+		}
+
+		// wake the sender: the request is gone
+		c.sendCond.Broadcast()
+		c.sendMu.Unlock()
+
+		return
+	}
+
+	c.sendMu.Unlock()
 
 	r.resolve(err)
-
-	c.reqQueued.Delete(stream)
 }
 
 func (c *Conn) readLoop() {
@@ -523,7 +592,7 @@ func (c *Conn) readLoop() {
 		if ri, ok := c.reqQueued.Load(fr.Stream()); ok {
 			r := ri.(*Ctx)
 
-			err := c.readStream(fr, r.Response)
+			err := c.readStream(fr, r)
 			if err == nil {
 				if fr.Flags().Has(FlagEndStream) {
 					c.finish(r, fr.Stream(), nil)
@@ -562,7 +631,16 @@ func (c *Conn) writeRequest(ctx *Ctx) error {
 
 	req := ctx.Request
 
-	hasBody := len(req.Body()) != 0
+	// a streamed body must not go through Body(), which would buffer it
+	// whole in memory
+	streamedBody := req.IsBodyStream()
+
+	var body []byte
+	if !streamedBody {
+		body = req.Body()
+	}
+
+	hasBody := streamedBody || len(body) != 0
 
 	enc := c.enc
 
@@ -599,6 +677,13 @@ func (c *Conn) writeRequest(ctx *Ctx) error {
 			continue
 		}
 
+		// connection-specific fields are forbidden in HTTP/2 (RFC 9113,
+		// section 8.2.2); fasthttp adds Transfer-Encoding to requests
+		// with a body of unknown length
+		if isConnectionSpecificField(k) {
+			continue
+		}
+
 		hf.SetBytes(k, v)
 		ToLower(hf.KeyBytes())
 		enc.AppendHeaderField(h, hf, false)
@@ -614,16 +699,32 @@ func (c *Conn) writeRequest(ctx *Ctx) error {
 
 	_, err := fr.WriteTo(c.bw)
 	if err == nil && hasBody {
-		// release headers bc it's going to get replaced by the data frame
-		ReleaseFrame(h)
+		if !streamedBody && c.tryReserveSendWindow(ctx, int64(len(body))) {
+			// fast path: the whole buffered body fits the server's
+			// flow-control windows right now, write it inline
 
-		err = writeData(c.bw, fr, req.Body())
+			// release headers bc it's going to get replaced by the data frame
+			ReleaseFrame(h)
+
+			err = writeData(c.bw, fr, body)
+		} else {
+			// the body goes out through its own goroutine, paced by the
+			// server's flow-control windows; DATA frames travel through
+			// c.out, so other requests aren't blocked behind this one.
+			// While the sender runs it owns the Request: resolutions
+			// hold until it exits.
+			c.sendMu.Lock()
+			ctx.bodySending = true
+			c.sendMu.Unlock()
+
+			go c.sendRequestBody(ctx, id)
+		}
 	}
 
 	if err == nil {
 		err = c.bw.Flush()
 		if err == nil {
-			atomic.AddInt32(&c.openStreams, 1)
+			c.openStreams.Add(1)
 		}
 	}
 
@@ -659,6 +760,235 @@ func writeData(bw *bufio.Writer, fh *FrameHeader, body []byte) (err error) {
 	return err
 }
 
+// connectionSpecificFields are forbidden in HTTP/2 (RFC 9113, section
+// 8.2.2): connection-level semantics travel in frames instead.
+var connectionSpecificFields = [][]byte{
+	[]byte("connection"),
+	[]byte("transfer-encoding"),
+	[]byte("keep-alive"),
+	[]byte("proxy-connection"),
+	[]byte("upgrade"),
+}
+
+func isConnectionSpecificField(k []byte) bool {
+	for _, f := range connectionSpecificFields {
+		if bytes.EqualFold(k, f) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// tryReserveSendWindow reserves n bytes from the connection and stream
+// send windows if both fit right now, so small buffered bodies skip the
+// sender goroutine.
+func (c *Conn) tryReserveSendWindow(ctx *Ctx, n int64) bool {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
+	if c.serverWindow < n || c.serverInitialWindow+ctx.sendWindow < n {
+		return false
+	}
+
+	c.serverWindow -= n
+	ctx.sendWindow -= n
+
+	return true
+}
+
+// waitSendWindow reserves up to want bytes from the connection and stream
+// send windows, blocking until some window opens. It returns a negative
+// value when the request or the connection ended while waiting.
+func (c *Conn) waitSendWindow(ctx *Ctx, id uint32, want int64) int64 {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
+	for {
+		if c.Closed() {
+			return -1
+		}
+
+		if _, ok := c.reqQueued.Load(id); !ok {
+			return -1
+		}
+
+		grant := want
+		if c.serverWindow < grant {
+			grant = c.serverWindow
+		}
+		if win := c.serverInitialWindow + ctx.sendWindow; win < grant {
+			grant = win
+		}
+
+		if grant > 0 {
+			c.serverWindow -= grant
+			ctx.sendWindow -= grant
+
+			return grant
+		}
+
+		c.sendCond.Wait()
+	}
+}
+
+// refundSendWindow gives back the reserved bytes a body read didn't use.
+func (c *Conn) refundSendWindow(ctx *Ctx, n int64) {
+	c.sendMu.Lock()
+	c.serverWindow += n
+	ctx.sendWindow += n
+	c.sendCond.Broadcast()
+	c.sendMu.Unlock()
+}
+
+// abortRequestBody resets a stream whose request body won't be completed,
+// so the server doesn't wait on it.
+func (c *Conn) abortRequestBody(id uint32) {
+	if c.Closed() {
+		return
+	}
+
+	fr := AcquireFrameHeader()
+	fr.SetStream(id)
+
+	rst := AcquireFrame(FrameResetStream).(*RstStream)
+	rst.SetCode(NoError)
+	fr.SetBody(rst)
+
+	select {
+	case c.out <- fr:
+	case <-c.closeCh:
+		ReleaseFrameHeader(fr)
+	}
+}
+
+// sendRequestBody streams a request body on its own goroutine, paced by
+// the server's flow-control windows. The DATA frames travel through c.out,
+// so control frames and other requests keep flowing while this body waits
+// for window; the last frame carries END_STREAM. When the request finishes
+// early (a response before the upload ended) the rest of the body is
+// dropped and the stream reset.
+func (c *Conn) sendRequestBody(ctx *Ctx, id uint32) {
+	// the sender owns ctx.Request until it exits: deliver the resolution
+	// that arrived in the meantime only after letting go
+	defer func() {
+		c.sendMu.Lock()
+		ctx.bodySending = false
+		pending, err := ctx.finishPending, ctx.finishErr
+		c.sendMu.Unlock()
+
+		if pending {
+			ctx.resolve(err)
+		}
+	}()
+
+	var (
+		body   []byte
+		reader io.Reader
+		// size is what remains of a declared body length, negative when
+		// unknown
+		size int64 = -1
+	)
+
+	req := ctx.Request
+	if req.IsBodyStream() {
+		reader = req.BodyStream()
+		size = int64(req.Header.ContentLength())
+	} else {
+		body = req.Body()
+	}
+
+	var buf []byte
+	if reader != nil {
+		buf = copyBufPool.Get().([]byte)
+		defer copyBufPool.Put(buf) //nolint:staticcheck // buf is never resliced
+	}
+
+	for {
+		want := int64(1 << 14) // max frame size 16384
+		if reader == nil {
+			if int64(len(body)) < want {
+				want = int64(len(body))
+			}
+		} else if size >= 0 && size < want {
+			want = size
+		}
+
+		var grant int64
+		if want > 0 {
+			grant = c.waitSendWindow(ctx, id, want)
+			if grant < 0 {
+				// the request already ended (an early response, a
+				// cancel or the connection going away): the server
+				// must not keep waiting for the body
+				c.abortRequestBody(id)
+				return
+			}
+		}
+
+		var chunk []byte
+		last := false
+
+		if reader == nil {
+			chunk = body[:grant]
+			body = body[grant:]
+			last = len(body) == 0
+		} else {
+			var n int
+			var err error
+
+			if grant > 0 {
+				n, err = reader.Read(buf[:grant])
+			}
+
+			chunk = buf[:n]
+
+			if size > 0 {
+				size -= int64(n)
+			}
+
+			// give back what the read didn't use
+			if unused := grant - int64(n); unused > 0 {
+				c.refundSendWindow(ctx, unused)
+			}
+
+			if err != nil && !errors.Is(err, io.EOF) {
+				// the body source failed: the server must not take the
+				// upload as complete, and the caller must know
+				c.abortRequestBody(id)
+				c.finish(ctx, id, err)
+
+				return
+			}
+
+			// EOF, a stalled reader or a sent-out declared size all end
+			// the body
+			last = err != nil || n == 0 || size == 0
+		}
+
+		fr := AcquireFrameHeader()
+		fr.SetStream(id)
+
+		data := AcquireFrame(FrameData).(*Data)
+		data.SetEndStream(last)
+		data.SetPadding(false)
+		data.SetData(chunk)
+
+		fr.SetBody(data)
+
+		select {
+		case c.out <- fr:
+		case <-c.closeCh:
+			ReleaseFrameHeader(fr)
+			return
+		}
+
+		if last {
+			return
+		}
+	}
+}
+
 func (c *Conn) readNext() (fr *FrameHeader, err error) {
 loop:
 	for err == nil {
@@ -678,15 +1008,18 @@ loop:
 				c.handleSettings(st)
 			}
 		case FrameWindowUpdate:
-			win := int32(fr.Body().(*WindowUpdate).Increment())
+			win := int64(fr.Body().(*WindowUpdate).Increment())
 
-			atomic.AddInt32(&c.serverWindow, win)
+			c.sendMu.Lock()
+			c.serverWindow += win
+			c.sendCond.Broadcast()
+			c.sendMu.Unlock()
 		case FramePing:
 			ping := fr.Body().(*Ping)
 			if !ping.IsAck() {
 				c.handlePing(ping)
 			} else {
-				c.unacks--
+				c.unacks.Add(-1)
 			}
 		case FrameGoAway:
 			ga := fr.Body().(*GoAway)
@@ -730,7 +1063,7 @@ func (c *Conn) writePing() error {
 	if err == nil {
 		err = c.bw.Flush()
 		if err == nil {
-			c.unacks++
+			c.unacks.Add(1)
 		}
 	}
 
@@ -740,7 +1073,14 @@ func (c *Conn) writePing() error {
 func (c *Conn) handleSettings(st *Settings) {
 	st.CopyTo(&c.serverS)
 
-	c.serverStreamWindow += int32(c.serverS.MaxWindowSize())
+	// a changed INITIAL_WINDOW_SIZE applies to every stream, the open
+	// ones retroactively (RFC 9113, section 6.9.2): the send windows
+	// derive from this base
+	c.sendMu.Lock()
+	c.serverInitialWindow = int64(c.serverS.MaxWindowSize())
+	c.sendCond.Broadcast()
+	c.sendMu.Unlock()
+
 	c.enc.SetMaxTableSize(st.HeaderTableSize())
 
 	// reply back
@@ -770,7 +1110,9 @@ func (c *Conn) handlePing(ping *Ping) {
 // to retry it even if it's not idempotent (RFC 9113, section 8.7).
 var ErrStreamRefused = errors.New("stream refused by the server")
 
-func (c *Conn) readStream(fr *FrameHeader, res *fasthttp.Response) (err error) {
+func (c *Conn) readStream(fr *FrameHeader, ctx *Ctx) (err error) {
+	res := ctx.Response
+
 	switch fr.Type() {
 	case FrameHeaders, FrameContinuation:
 		h := fr.Body().(FrameWithHeaders)
@@ -782,18 +1124,26 @@ func (c *Conn) readStream(fr *FrameHeader, res *fasthttp.Response) (err error) {
 		} else {
 			err = NewResetStreamError(rst.Code(), "stream reset by the server")
 		}
+	case FrameWindowUpdate:
+		// the server opened the stream's send window: wake the request's
+		// body sender
+		c.sendMu.Lock()
+		ctx.sendWindow += int64(fr.Body().(*WindowUpdate).Increment())
+		c.sendCond.Broadcast()
+		c.sendMu.Unlock()
 	case FrameData:
 		c.currentWindow -= int32(fr.Len())
 		currentWin := c.currentWindow
-
-		c.serverWindow -= int32(fr.Len())
 
 		data := fr.Body().(*Data)
 		if data.Len() != 0 {
 			res.AppendBody(data.Data())
 
-			// let's send the window update
-			c.updateWindow(fr.Stream(), fr.Len())
+			// replenish the stream window, unless this frame just
+			// ended the stream
+			if !fr.Flags().Has(FlagEndStream) {
+				c.updateWindow(fr.Stream(), fr.Len())
+			}
 		}
 
 		if currentWin < c.maxWindow/2 {

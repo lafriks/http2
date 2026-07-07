@@ -793,8 +793,13 @@ loop:
 						if fr.Type() == FrameData {
 							sc.applyDataFlowControl(fr, false)
 						}
-					case fr.Type() == FramePriority, fr.Type() == FrameResetStream:
-						// tolerated on any closed stream
+					case fr.Type() == FramePriority,
+						fr.Type() == FrameResetStream,
+						fr.Type() == FrameWindowUpdate:
+						// PRIORITY is tolerated on any closed stream, and
+						// RST_STREAM/WINDOW_UPDATE race with the closure:
+						// the peer sends them before learning the stream
+						// ended (RFC 9113, section 5.1)
 					default:
 						sc.writeGoAway(fr.Stream(), StreamClosedError, "frame on closed stream")
 					}

@@ -2,6 +2,7 @@ package http2
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -464,7 +465,7 @@ func TestRequestHeaderSizeLimit(t *testing.T) {
 
 			end := fr.Flags().Has(FlagEndStream)
 
-			if err := c.readStream(fr, res); err != nil {
+			if err := c.readStream(fr, &Ctx{Response: res}); err != nil {
 				t.Fatal(err)
 			}
 
@@ -661,7 +662,7 @@ func TestRequestBodySizeLimit(t *testing.T) {
 
 			end := fr.Flags().Has(FlagEndStream)
 
-			if err := c.readStream(fr, res); err != nil {
+			if err := c.readStream(fr, &Ctx{Response: res}); err != nil {
 				t.Fatal(err)
 			}
 
@@ -2580,4 +2581,161 @@ func TestResponseFlowControlStreamedBody(t *testing.T) {
 			PingInterval: -1,
 		},
 	})
+}
+
+// neverEndingReader supplies an endless request body.
+type neverEndingReader struct{}
+
+func (neverEndingReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+
+	return len(p), nil
+}
+
+func newClientConn(t *testing.T, s *Server) (*Conn, net.Listener) {
+	t.Helper()
+
+	s.cnf.defaults()
+
+	ln := fasthttputil.NewInmemoryListener()
+
+	go serve(s, ln)
+
+	cc, err := ln.Dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewConn(cc, ConnOpts{})
+	if err := c.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+
+	return c, ln
+}
+
+func doRequest(t *testing.T, c *Conn, req *fasthttp.Request, res *fasthttp.Response) {
+	t.Helper()
+
+	ctx := &Ctx{
+		Request:  req,
+		Response: res,
+		Err:      make(chan error, 1),
+	}
+
+	c.Write(ctx)
+
+	select {
+	case err := <-ctx.Err:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second * 10):
+		t.Fatal("request timed out")
+	}
+}
+
+func TestClientStreamedRequestBody(t *testing.T) {
+	// well over the server's 4MB per-stream window, so the upload can
+	// only complete through the WINDOW_UPDATEs the server sends as its
+	// handler consumes the body
+	const bodySize = 8 << 20
+
+	s := &Server{
+		s: &fasthttp.Server{
+			StreamRequestBody:  true,
+			MaxRequestBodySize: 32 << 20,
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				n, err := io.Copy(io.Discard, ctx.Request.BodyStream())
+				if err != nil {
+					ctx.Error(err.Error(), fasthttp.StatusInternalServerError)
+					return
+				}
+
+				fmt.Fprintf(ctx, "got=%d", n)
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln := newClientConn(t, s)
+	defer c.Close()
+	defer ln.Close()
+
+	want := fmt.Sprintf("got=%d", bodySize)
+
+	// a streamed body of declared size
+	req := fasthttp.AcquireRequest()
+	res := fasthttp.AcquireResponse()
+	req.SetRequestURI("https://localhost/")
+	req.Header.SetMethod("POST")
+	req.SetBodyStream(bytes.NewReader(make([]byte, bodySize)), bodySize)
+
+	doRequest(t, c, req, res)
+
+	if got := string(res.Body()); got != want {
+		t.Fatalf("streamed body: got %q, want %q", got, want)
+	}
+
+	// a buffered body over the window takes the flow-controlled path too
+	req.Reset()
+	res.Reset()
+	req.SetRequestURI("https://localhost/")
+	req.Header.SetMethod("POST")
+	req.SetBody(make([]byte, bodySize))
+
+	doRequest(t, c, req, res)
+
+	if got := string(res.Body()); got != want {
+		t.Fatalf("buffered body: got %q, want %q", got, want)
+	}
+}
+
+func TestClientStreamedRequestBodyEarlyResponse(t *testing.T) {
+	s := &Server{
+		s: &fasthttp.Server{
+			StreamRequestBody: true,
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				// respond without touching the body
+				ctx.WriteString("done")
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln := newClientConn(t, s)
+	defer c.Close()
+	defer ln.Close()
+
+	// an endless body of unknown length: the response must still arrive,
+	// aborting the upload
+	req := fasthttp.AcquireRequest()
+	res := fasthttp.AcquireResponse()
+	req.SetRequestURI("https://localhost/")
+	req.Header.SetMethod("POST")
+	req.SetBodyStream(neverEndingReader{}, -1)
+
+	doRequest(t, c, req, res)
+
+	if got := string(res.Body()); got != "done" {
+		t.Fatalf("got %q, want %q", got, "done")
+	}
+
+	// the connection must survive the aborted upload and keep serving
+	req.Reset()
+	res.Reset()
+	req.SetRequestURI("https://localhost/")
+	req.Header.SetMethod("GET")
+
+	doRequest(t, c, req, res)
+
+	if got := string(res.Body()); got != "done" {
+		t.Fatalf("second request: got %q, want %q", got, "done")
+	}
 }

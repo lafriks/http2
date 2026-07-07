@@ -50,6 +50,19 @@ type Ctx struct {
 	Err      chan error
 
 	streamID uint32
+
+	// sendWindow is the stream's send-window delta: the server's
+	// WINDOW_UPDATEs minus the DATA sent; the effective window adds the
+	// server's INITIAL_WINDOW_SIZE. Guarded by Conn.sendMu.
+	sendWindow int64
+
+	// bodySending marks that a sender goroutine still holds the Request:
+	// resolving must wait for it, or the caller would recycle the request
+	// under the sender's feet. finishPending/finishErr carry the deferred
+	// resolution the sender delivers on exit. Guarded by Conn.sendMu.
+	bodySending   bool
+	finishPending bool
+	finishErr     error
 }
 
 // resolve will resolve the context, meaning that provided an error,
@@ -158,7 +171,9 @@ func (cl *Client) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Request, res 
 
 	if cl.opts.MaxResponseTime > 0 {
 		cancelTimer = time.AfterFunc(cl.opts.MaxResponseTime, func() {
-			ch <- ErrRequestCanceled
+			// cancel resolves the request with ErrRequestCanceled; going
+			// through it (instead of writing to ch directly) waits out a
+			// body sender that may still hold the request
 			c.cancel(ctx)
 		})
 	}
