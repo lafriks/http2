@@ -91,9 +91,16 @@ func ConfigureClient(c *fasthttp.HostClient, opts ClientOpts) error {
 //     a 413 without reaching the handler, and the stream is reset with NO_ERROR
 //     (RFC 9113, section 8.1.1) so the client can stop the upload; the exceeding
 //     payload is never buffered. Zero means fasthttp.DefaultMaxRequestBodySize.
+//   - ReadBufferSize: Limits the decoded size of a request's header list, the
+//     same way it caps HTTP/1 headers. Over-limit requests are answered with a
+//     431 without reaching the handler; header blocks growing several times
+//     past the limit (a CONTINUATION flood) close the connection with
+//     ENHANCE_YOUR_CALM. The limit is advertised as
+//     SETTINGS_MAX_HEADER_LIST_SIZE. Zero means 4096, fasthttp's default
+//     buffer size.
 //   - ErrorHandler: Called for the errors the HTTP/2 server generates itself
-//     (currently fasthttp.ErrBodyTooLarge); the response it builds is sent
-//     instead of the default one.
+//     (fasthttp.ErrBodyTooLarge, http2.ErrTooLargeHeaders); the response it
+//     builds is sent instead of the default one.
 func ConfigureServer(s *fasthttp.Server, cnf ServerConfig) *Server {
 	cnf.defaults()
 

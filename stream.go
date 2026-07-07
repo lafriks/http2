@@ -61,6 +61,16 @@ type Stream struct {
 	// it is answered with 413 without reaching the handler, and the stream
 	// is reset with NO_ERROR to stop the rest of the upload
 	tooLargeBody bool
+	// headerListSize accumulates the decoded size of the request header
+	// list as RFC 9113 (section 10.5) defines it: name length + value
+	// length + 32 per field
+	headerListSize int
+	// headerBlockSize accumulates the raw (compressed) header block bytes
+	// received across HEADERS and CONTINUATION frames
+	headerBlockSize int
+	// tooLargeHeaders marks a request whose header list exceeds the
+	// server's limit: it is answered with 431 without reaching the handler
+	tooLargeHeaders bool
 	// resetByServer records that the server sent a RST_STREAM for this
 	// stream: frames the client sent before learning about the reset must
 	// be ignored instead of being treated as a connection error
@@ -100,6 +110,9 @@ func NewStream(id uint32, win int32) *Stream {
 	strm.headerViolation = ""
 	strm.expectedContentLength = -1
 	strm.tooLargeBody = false
+	strm.headerListSize = 0
+	strm.headerBlockSize = 0
+	strm.tooLargeHeaders = false
 	strm.resetByServer = false
 
 	return strm

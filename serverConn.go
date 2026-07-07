@@ -72,6 +72,11 @@ type serverConn struct {
 	// maxRequestBodySize limits how much of a request body is buffered,
 	// mirroring fasthttp.Server.MaxRequestBodySize
 	maxRequestBodySize int
+	// maxHeaderListSize limits the decoded size of a request's header
+	// list, mirroring the header size limit fasthttp derives from
+	// Server.ReadBufferSize. It is advertised as
+	// SETTINGS_MAX_HEADER_LIST_SIZE.
+	maxHeaderListSize int
 	// errorHandler mirrors fasthttp.Server.ErrorHandler for the errors
 	// the HTTP/2 server generates itself (fasthttp.ErrBodyTooLarge)
 	errorHandler func(*fasthttp.RequestCtx, error)
@@ -662,12 +667,16 @@ loop:
 
 			handleState(fr, strm)
 
-			// a request over MaxRequestBodySize doesn't need the rest of
-			// its body: answer with the 413 right away and ask the client
-			// to stop sending with a RST_STREAM carrying NO_ERROR
-			// (RFC 9113, section 8.1.1); the frames still in flight are
-			// absorbed by the reset tolerance above
-			if strm.tooLargeBody && strm.State() == StreamStateOpen {
+			// a request over MaxRequestBodySize or with an over-limit
+			// header list doesn't need the rest of its body: answer with
+			// the 413/431 right away and ask the client to stop sending
+			// with a RST_STREAM carrying NO_ERROR (RFC 9113, section
+			// 8.1.1); the frames still in flight are absorbed by the
+			// reset tolerance above. The header block must be complete
+			// first, though: aborting in the middle of it would stop
+			// decoding the remaining fragments and desync the HPACK tables.
+			if (strm.tooLargeBody || strm.tooLargeHeaders) &&
+				strm.headersFinished && strm.State() == StreamStateOpen {
 				sc.handleEndRequest(strm)
 
 				strm.resetByServer = true
@@ -902,14 +911,18 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 			// calling req.URI() triggers a URL parsing, so because of that we need to delay the URL parsing.
 			strm.ctx.Request.URI().SetSchemeBytes(strm.scheme)
 
-			if err := validateRequestHeaders(strm, fr); err != nil {
-				return err
-			}
+			// an over-limit header list skips the validation: fields were
+			// discarded and the request is answered with 431 regardless
+			if !strm.tooLargeHeaders {
+				if err := validateRequestHeaders(strm, fr); err != nil {
+					return err
+				}
 
-			// a declared length over the limit rejects the request before
-			// buffering anything
-			if strm.expectedContentLength > int64(sc.maxRequestBodySize) {
-				strm.tooLargeBody = true
+				// a declared length over the limit rejects the request
+				// before buffering anything
+				if strm.expectedContentLength > int64(sc.maxRequestBodySize) {
+					strm.tooLargeBody = true
+				}
 			}
 		}
 	case FrameData:
@@ -989,7 +1002,17 @@ func (sc *serverConn) handleHeaderFrame(strm *Stream, fr *FrameHeader) error {
 		return NewGoAwayError(ProtocolError, "stream that depends on itself")
 	}
 
-	b := append(strm.previousHeaderBytes, fr.Body().(FrameWithHeaders).Headers()...)
+	fragment := fr.Body().(FrameWithHeaders).Headers()
+
+	// hard cap on the raw header block: a client streaming an endless
+	// block through CONTINUATION frames (a CONTINUATION flood) must not
+	// grow memory or keep the decoder busy indefinitely
+	strm.headerBlockSize += len(fragment)
+	if strm.headerBlockSize > sc.headerBlockCap() {
+		return NewGoAwayError(EnhanceYourCalm, "header block too large")
+	}
+
+	b := append(strm.previousHeaderBytes, fragment...)
 	hf := AcquireHeaderField()
 	req := &strm.ctx.Request
 
@@ -1014,6 +1037,19 @@ func (sc *serverConn) handleHeaderFrame(strm *Stream, fr *FrameHeader) error {
 		}
 
 		fieldsProcessed++
+
+		// RFC 9113 (section 10.5): the size of a header list is the sum
+		// of its field sizes: name length + value length + 32
+		strm.headerListSize += len(hf.KeyBytes()) + len(hf.ValueBytes()) + 32
+		if strm.headerListSize > sc.maxHeaderListSize {
+			strm.tooLargeHeaders = true
+		}
+
+		if strm.tooLargeHeaders {
+			// keep decoding so the HPACK tables stay synchronized, but
+			// discard the fields: the request is answered with 431
+			continue
+		}
 
 		k, v := hf.KeyBytes(), hf.ValueBytes()
 
@@ -1044,6 +1080,17 @@ func (sc *serverConn) handleHeaderFrame(strm *Stream, fr *FrameHeader) error {
 	strm.headerBlockNum++
 
 	return err
+}
+
+// headerBlockCap bounds the raw (compressed) size of a request's header
+// block. It leaves room over the decoded limit so that requests moderately
+// over it still get the graceful 431 instead of a connection error.
+func (sc *serverConn) headerBlockCap() int {
+	if c := sc.maxHeaderListSize * 4; c > 16384 {
+		return c
+	}
+
+	return 16384
 }
 
 const (
@@ -1205,15 +1252,22 @@ func (sc *serverConn) handleEndRequest(strm *Stream) {
 	ctx := strm.ctx
 	ctx.Request.Header.SetProtocolBytes(StringHTTP2)
 
-	if strm.tooLargeBody {
+	switch {
+	case strm.tooLargeHeaders:
 		// same as fasthttp: the error goes through the configured
 		// ErrorHandler, which can customize the response
+		if sc.errorHandler != nil {
+			sc.errorHandler(ctx, ErrTooLargeHeaders)
+		} else {
+			ctx.Error("Too big request header", fasthttp.StatusRequestHeaderFieldsTooLarge)
+		}
+	case strm.tooLargeBody:
 		if sc.errorHandler != nil {
 			sc.errorHandler(ctx, fasthttp.ErrBodyTooLarge)
 		} else {
 			ctx.Error(fasthttp.ErrBodyTooLarge.Error(), fasthttp.StatusRequestEntityTooLarge)
 		}
-	} else {
+	default:
 		sc.h(ctx)
 	}
 

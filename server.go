@@ -15,6 +15,10 @@ import (
 // after Shutdown has been called.
 var ErrServerShutdown = errors.New("server is shutting down")
 
+// ErrTooLargeHeaders is passed to fasthttp.Server.ErrorHandler for requests
+// whose header list exceeds the limit derived from ReadBufferSize.
+var ErrTooLargeHeaders = errors.New("too big request header")
+
 // ServerConfig ...
 type ServerConfig struct {
 	// PingInterval is the interval at which the server will send a
@@ -154,6 +158,13 @@ func (s *Server) ServeConn(c net.Conn) error {
 		maxRequestBodySize = fasthttp.DefaultMaxRequestBodySize
 	}
 
+	// same limit fasthttp applies to HTTP/1 headers, which are capped by
+	// the read buffer (4096 bytes is fasthttp's default buffer size)
+	maxHeaderListSize := s.s.ReadBufferSize
+	if maxHeaderListSize <= 0 {
+		maxHeaderListSize = 4096
+	}
+
 	sc := &serverConn{
 		c:                   c,
 		h:                   s.s.Handler,
@@ -161,6 +172,7 @@ func (s *Server) ServeConn(c net.Conn) error {
 		bw:                  bufio.NewWriterSize(c, 1<<14*10),
 		lastID:              0,
 		maxRequestBodySize:  maxRequestBodySize,
+		maxHeaderListSize:   maxHeaderListSize,
 		errorHandler:        s.s.ErrorHandler,
 		writer:              make(chan *FrameHeader, 128),
 		reader:              make(chan *FrameHeader, 128),
@@ -187,6 +199,7 @@ func (s *Server) ServeConn(c net.Conn) error {
 	sc.st.Reset()
 	sc.st.SetMaxWindowSize(uint32(sc.maxWindow))
 	sc.st.SetMaxConcurrentStreams(uint32(s.cnf.MaxConcurrentStreams))
+	sc.st.SetMaxHeaderListSize(uint32(maxHeaderListSize))
 
 	if !s.trackConn(sc) {
 		return ErrServerShutdown

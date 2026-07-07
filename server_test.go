@@ -331,6 +331,202 @@ func TestServerResetToleratesInFlightFrames(t *testing.T) {
 	}
 }
 
+func TestRequestHeaderSizeLimit(t *testing.T) {
+	var handled int
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				handled++
+				ctx.WriteString("OK")
+			},
+			ReadBufferSize: 512,
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	readResponse := func(id uint32) int {
+		t.Helper()
+
+		res := fasthttp.AcquireResponse()
+		defer fasthttp.ReleaseResponse(res)
+
+		for {
+			fr, err := c.readNext()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if fr.Stream() != id {
+				t.Fatalf("expected frame on stream %d, got %s on %d", id, fr.Type(), fr.Stream())
+			}
+
+			end := fr.Flags().Has(FlagEndStream)
+
+			if err := c.readStream(fr, res); err != nil {
+				t.Fatal(err)
+			}
+
+			ReleaseFrameHeader(fr)
+
+			if end {
+				return res.StatusCode()
+			}
+		}
+	}
+
+	bigValue := make([]byte, 600)
+	for i := range bigValue {
+		bigValue[i] = 'a'
+	}
+
+	// over-limit header list on a complete request: plain 431
+	h1 := makeHeadersOrdered(3, c.enc, true, true, [][2]string{
+		{":method", "GET"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+		{"x-big", string(bigValue)},
+	})
+	c.writeFrame(h1)
+
+	if status := readResponse(3); status != fasthttp.StatusRequestHeaderFieldsTooLarge {
+		t.Fatalf("expected 431, got %d", status)
+	}
+
+	// over-limit header list on a request with a pending body: the 431 is
+	// followed by a NO_ERROR reset aborting the upload
+	h2 := makeHeadersOrdered(5, c.enc, true, false, [][2]string{
+		{":method", "POST"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+		{"x-big", string(bigValue)},
+	})
+	c.writeFrame(h2)
+
+	if status := readResponse(5); status != fasthttp.StatusRequestHeaderFieldsTooLarge {
+		t.Fatalf("expected 431, got %d", status)
+	}
+
+	fr, err := c.readNext()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if fr.Type() != FrameResetStream || fr.Body().(*RstStream).Code() != NoError {
+		t.Fatalf("expected NoError reset, got %s", fr.Type())
+	}
+
+	ReleaseFrameHeader(fr)
+
+	if handled != 0 {
+		t.Fatalf("handler ran %d times for rejected requests", handled)
+	}
+
+	// the connection survived and normal requests still work
+	h3 := makeHeaders(7, c.enc, true, true, map[string]string{
+		string(StringAuthority): "localhost",
+		string(StringMethod):    "GET",
+		string(StringPath):      "/",
+		string(StringScheme):    "https",
+	})
+	c.writeFrame(h3)
+
+	if status := readResponse(7); status != fasthttp.StatusOK {
+		t.Fatalf("expected 200, got %d", status)
+	}
+
+	if handled != 1 {
+		t.Fatalf("expected the handler to run once, ran %d times", handled)
+	}
+}
+
+func TestContinuationFloodIsStopped(t *testing.T) {
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				ctx.WriteString("OK")
+			},
+			ReadBufferSize: 512,
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	// an endless header block: HEADERS without END_HEADERS followed by
+	// CONTINUATION frames until the server gives up
+	h1 := makeHeadersOrdered(3, c.enc, false, false, [][2]string{
+		{":method", "GET"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+	})
+	c.writeFrame(h1)
+
+	filler := make([]byte, 1000)
+	for i := range filler {
+		filler[i] = 'b'
+	}
+
+	hf := AcquireHeaderField()
+	for i := 0; i < 64; i++ {
+		// encode one large field through the Headers frame, then move the
+		// raw fragment into a CONTINUATION frame
+		henc := AcquireFrame(FrameHeaders).(*Headers)
+		hf.Set("x-flood-"+strconv.Itoa(i), string(filler))
+		c.enc.AppendHeaderField(henc, hf, false)
+
+		cont := AcquireFrame(FrameContinuation).(*Continuation)
+		cont.SetHeader(append([]byte{}, henc.Headers()...))
+		cont.SetEndHeaders(false)
+		ReleaseFrame(henc)
+
+		fr := AcquireFrameHeader()
+		fr.SetStream(3)
+		fr.SetBody(cont)
+
+		if _, err := fr.WriteTo(c.bw); err != nil {
+			break // the server already closed the connection
+		}
+		if err := c.bw.Flush(); err != nil {
+			break
+		}
+
+		ReleaseFrameHeader(fr)
+	}
+
+	// the server must answer with ENHANCE_YOUR_CALM instead of decoding
+	// the flood forever
+	fr, err := c.readNext()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if fr.Type() != FrameGoAway {
+		t.Fatalf("expected GoAway, got %s", fr.Type())
+	}
+
+	if code := fr.Body().(*GoAway).Code(); code != EnhanceYourCalm {
+		t.Fatalf("expected EnhanceYourCalm, got %s", code)
+	}
+}
+
 func TestRequestBodySizeLimit(t *testing.T) {
 	var handled int
 	s := &Server{
