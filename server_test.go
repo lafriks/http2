@@ -1994,3 +1994,147 @@ func TestResponseTrailers(t *testing.T) {
 		id += 2
 	}
 }
+
+func TestWriteTimeout(t *testing.T) {
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				// a streamed response far larger than the TCP buffers, so
+				// that the writes stall once the client stops reading
+				chunk := make([]byte, 32<<10)
+				ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
+					for range 2048 {
+						if _, err := w.Write(chunk); err != nil {
+							return
+						}
+					}
+				})
+			},
+			WriteTimeout: time.Millisecond * 50,
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+	s.cnf.defaults()
+
+	// a real TCP connection: once its buffers are full a write blocks,
+	// which is how a stalled client looks to the server
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	served := make(chan struct{})
+	go func() {
+		sconn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+
+		_ = s.ServeConn(sconn)
+		close(served)
+	}()
+
+	cc, err := net.Dial("tcp4", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+
+	c := NewConn(cc, ConnOpts{})
+	if err := c.doHandshake(); err != nil {
+		t.Fatal(err)
+	}
+
+	// the client sends a request and never reads the response: the write
+	// deadline must tear the connection down instead of blocking forever
+	_ = c.writeFrame(makeHeaders(3, c.enc, true, true, map[string]string{
+		string(StringAuthority): "localhost",
+		string(StringMethod):    "GET",
+		string(StringPath):      "/",
+		string(StringScheme):    "https",
+	}))
+
+	select {
+	case <-served:
+	case <-time.After(time.Second * 5):
+		t.Fatal("the write timeout didn't close the stalled connection")
+	}
+}
+
+func TestClosedStreamsPruned(t *testing.T) {
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				ctx.WriteString("OK")
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	hs := map[string]string{
+		string(StringAuthority): "localhost",
+		string(StringMethod):    "GET",
+		string(StringPath):      "/",
+		string(StringScheme):    "https",
+	}
+
+	// cycle enough streams to trigger the closed-stream pruning
+	id := uint32(3)
+	for range 1200 {
+		c.writeFrame(makeHeaders(id, c.enc, true, true, hs))
+
+		for _, expect := range []FrameType{FrameHeaders, FrameData} {
+			fr, err := c.readNext()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if fr.Type() != expect || fr.Stream() != id {
+				t.Fatalf("expected %s on stream %d, got %s on %d", expect, id, fr.Type(), fr.Stream())
+			}
+
+			ReleaseFrameHeader(fr)
+		}
+
+		id += 2
+	}
+
+	// stream 3 closed over a thousand streams ago and its entry has been
+	// pruned: a stray frame on it must be tolerated below the watermark,
+	// not answered with a GOAWAY
+	if err := writeDataFrame(c, 3, true, []byte("stray")); err != nil {
+		t.Fatal(err)
+	}
+
+	// the connection must still serve requests
+	c.writeFrame(makeHeaders(id, c.enc, true, true, hs))
+
+	for _, expect := range []FrameType{FrameHeaders, FrameData} {
+		fr, err := c.readNext()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if fr.Type() != expect || fr.Stream() != id {
+			t.Fatalf("expected %s on stream %d, got %s on %d", expect, id, fr.Type(), fr.Stream())
+		}
+
+		ReleaseFrameHeader(fr)
+	}
+}

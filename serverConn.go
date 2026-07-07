@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -68,6 +69,11 @@ type serverConn struct {
 	//
 	// Therefore, a client that didn't send a request for more than `maxIdleTime` will see it's connection closed.
 	maxIdleTime time.Duration
+
+	// writeTimeout mirrors fasthttp.Server.WriteTimeout: the deadline a
+	// single write into the connection gets before the connection is
+	// considered stalled and closed
+	writeTimeout time.Duration
 
 	// maxRequestBodySize limits how much of a request body is buffered,
 	// mirroring fasthttp.Server.MaxRequestBodySize
@@ -421,6 +427,37 @@ func (sc *serverConn) handleStreams() {
 	// being a connection error
 	closedStrms := make(map[uint32]bool)
 
+	// closedBelow is the pruning watermark for closedStrms: stream IDs are
+	// monotonic, so once the map doubles maxClosedStrms the older half is
+	// dropped and IDs below the watermark that aren't alive are known to
+	// be long closed.
+	var closedBelow uint32
+
+	const maxClosedStrms = 512
+
+	rememberClosed := func(strmID uint32, resetByServer bool) {
+		closedStrms[strmID] = resetByServer
+
+		if len(closedStrms) < maxClosedStrms*2 {
+			return
+		}
+
+		ids := make([]uint32, 0, len(closedStrms))
+		for id := range closedStrms {
+			ids = append(ids, id)
+		}
+		slices.Sort(ids)
+
+		ids = ids[:len(ids)-maxClosedStrms]
+		for _, id := range ids {
+			delete(closedStrms, id)
+		}
+
+		if watermark := ids[len(ids)-1] + 1; watermark > closedBelow {
+			closedBelow = watermark
+		}
+	}
+
 	closeStream := func(strm *Stream) {
 		if strm.origType == FrameHeaders {
 			openStreams--
@@ -428,7 +465,7 @@ func (sc *serverConn) handleStreams() {
 
 		strmID := strm.ID()
 
-		closedStrms[strm.ID()] = strm.resetByServer
+		rememberClosed(strm.ID(), strm.resetByServer)
 		strms.Del(strm.ID())
 
 		ctxPool.Put(strm.ctx)
@@ -589,7 +626,14 @@ loop:
 			if strm == nil {
 				// if the stream doesn't exist, create it
 
-				if resetByServer, ok := closedStrms[fr.Stream()]; ok {
+				resetByServer, ok := closedStrms[fr.Stream()]
+				if !ok && fr.Stream() < closedBelow {
+					// the stream ended so long ago that its entry has been
+					// pruned: tolerate stray frames like on a reset stream
+					ok, resetByServer = true, true
+				}
+
+				if ok {
 					switch {
 					case resetByServer:
 						// RFC 9113 (section 5.1): after sending RST_STREAM the
@@ -628,7 +672,7 @@ loop:
 					sc.writeReset(fr.Stream(), RefusedStreamError)
 					// remember the refusal: frames for this stream may
 					// already be in flight and must be ignored
-					closedStrms[fr.Stream()] = true
+					rememberClosed(fr.Stream(), true)
 
 					continue
 				}
@@ -1638,6 +1682,14 @@ func (sc *serverConn) writeLoop() {
 			continue
 		}
 
+		// mirror fasthttp.Server.WriteTimeout: the deadline is renewed
+		// before every frame, so a large streamed response only fails when
+		// a single frame can't be written in time (a stalled client), not
+		// because the response as a whole outlasted the timeout
+		if sc.writeTimeout > 0 {
+			_ = sc.c.SetWriteDeadline(time.Now().Add(sc.writeTimeout))
+		}
+
 		_, err := fr.WriteTo(sc.bw)
 		if err == nil && (len(sc.writer) == 0 || buffered > 10) {
 			err = sc.bw.Flush()
@@ -1650,7 +1702,19 @@ func (sc *serverConn) writeLoop() {
 
 		if err != nil {
 			sc.logger.Printf("ERROR: writeLoop: %s\n", err)
-			// TODO: sc.writer.err <- err
+
+			// closing the connection ends the readLoop and with it the
+			// regular teardown; meanwhile keep draining the channel so a
+			// large streamed response doesn't block handleStreams on a
+			// writer nobody consumes anymore
+			_ = sc.c.Close()
+
+			for fr := range sc.writer {
+				if fr != closeConnSentinel {
+					ReleaseFrameHeader(fr)
+				}
+			}
+
 			return
 		}
 	}

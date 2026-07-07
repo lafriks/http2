@@ -178,6 +178,7 @@ func (s *Server) ServeConn(c net.Conn) error {
 		reader:              make(chan *FrameHeader, 128),
 		maxRequestTime:      s.s.ReadTimeout,
 		maxIdleTime:         s.s.IdleTimeout,
+		writeTimeout:        s.s.WriteTimeout,
 		pingInterval:        s.cnf.PingInterval,
 		shutdown:            make(chan struct{}),
 		shutdownGracePeriod: s.cnf.ShutdownGracePeriod,
