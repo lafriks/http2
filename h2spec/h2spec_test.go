@@ -18,6 +18,7 @@ import (
 	"github.com/lafriks/http2"
 	"github.com/summerwind/h2spec/config"
 	"github.com/summerwind/h2spec/generic"
+	"github.com/summerwind/h2spec/hpack"
 	h2spec "github.com/summerwind/h2spec/http2"
 	"github.com/valyala/fasthttp"
 )
@@ -179,11 +180,14 @@ func runH2Spec(t *testing.T, streamRequestBody bool) {
 		{desc: "http2/8.1.2/1"},
 		{desc: "http2/8.1/1"},
 		{desc: "http2/8.2/1"},
-		{desc: "hpack/2.3.3"},
-		{desc: "hpack/4.2"},
-		{desc: "hpack/5.2"},
-		{desc: "hpack/6.1"},
-		{desc: "hpack/6.3"},
+		{desc: "hpack/2.3.3/1"},
+		{desc: "hpack/2.3.3/2"},
+		{desc: "hpack/4.2/1"},
+		{desc: "hpack/5.2/1"},
+		{desc: "hpack/5.2/2"},
+		{desc: "hpack/5.2/3"},
+		{desc: "hpack/6.1/1"},
+		{desc: "hpack/6.3/1"},
 	}
 
 	// Disable logs from h2spec
@@ -210,8 +214,11 @@ func runH2Spec(t *testing.T, streamRequestBody bool) {
 			}
 
 			tg := h2spec.Spec()
-			if strings.HasPrefix(test.desc, "generic") {
+			switch {
+			case strings.HasPrefix(test.desc, "generic"):
 				tg = generic.Spec()
+			case strings.HasPrefix(test.desc, "hpack"):
+				tg = hpack.Spec()
 			}
 
 			tg.Test(conf)
