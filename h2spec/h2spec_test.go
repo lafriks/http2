@@ -23,7 +23,18 @@ import (
 )
 
 func TestH2Spec(t *testing.T) {
-	port := launchLocalServer(t)
+	runH2Spec(t, false)
+}
+
+// TestH2SpecStreamRequestBody runs the same conformance suite against a
+// server with StreamRequestBody enabled: the handler consumes the body
+// through the streaming pipe while the DATA frames arrive.
+func TestH2SpecStreamRequestBody(t *testing.T) {
+	runH2Spec(t, true)
+}
+
+func runH2Spec(t *testing.T, streamRequestBody bool) {
+	port := launchLocalServer(t, streamRequestBody)
 
 	testCases := []struct {
 		desc string
@@ -213,7 +224,7 @@ func TestH2Spec(t *testing.T) {
 	}
 }
 
-func launchLocalServer(t *testing.T) int {
+func launchLocalServer(t *testing.T, streamRequestBody bool) int {
 	t.Helper()
 
 	certPEM, keyPEM, err := KeyPair("test.default", time.Time{})
@@ -223,8 +234,11 @@ func launchLocalServer(t *testing.T) int {
 
 	server := &fasthttp.Server{
 		Handler: func(ctx *fasthttp.RequestCtx) {
+			// consume the body so a streamed request exercises the pipe
+			_ = ctx.Request.Body()
 			ctx.Response.AppendBodyString("Test	 HTTP2")
 		},
+		StreamRequestBody: streamRequestBody,
 	}
 	http2.ConfigureServer(server, http2.ServerConfig{})
 

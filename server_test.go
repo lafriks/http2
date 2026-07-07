@@ -2138,3 +2138,311 @@ func TestClosedStreamsPruned(t *testing.T) {
 		ReleaseFrameHeader(fr)
 	}
 }
+
+func TestStreamRequestBody(t *testing.T) {
+	firstChunk := make(chan struct{})
+
+	s := &Server{
+		s: &fasthttp.Server{
+			StreamRequestBody: true,
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				br := ctx.Request.BodyStream()
+
+				buf := make([]byte, 5)
+				if _, err := io.ReadFull(br, buf); err != nil {
+					ctx.Error(err.Error(), fasthttp.StatusInternalServerError)
+					return
+				}
+
+				// the handler saw body bytes while the request was still
+				// open: that's what streaming means
+				close(firstChunk)
+
+				rest, err := io.ReadAll(br)
+				if err != nil {
+					ctx.Error(err.Error(), fasthttp.StatusInternalServerError)
+					return
+				}
+
+				fmt.Fprintf(ctx, "%s|%s", buf, rest)
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	c.writeFrame(makeHeadersOrdered(3, c.enc, true, false, [][2]string{
+		{":method", "POST"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+	}))
+
+	if err := writeDataFrame(c, 3, false, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+
+	// the handler must receive the first chunk before the request ends
+	select {
+	case <-firstChunk:
+	case <-time.After(time.Second * 5):
+		t.Fatal("the handler didn't see the body before the request ended")
+	}
+
+	if err := writeDataFrame(c, 3, true, []byte(" world")); err != nil {
+		t.Fatal(err)
+	}
+
+	var body []byte
+	for {
+		fr := readNextOn(t, c, 3)
+
+		if fr.Type() == FrameData {
+			body = append(body, fr.Body().(*Data).Data()...)
+		}
+
+		done := fr.Flags().Has(FlagEndStream)
+		ReleaseFrameHeader(fr)
+
+		if done {
+			break
+		}
+	}
+
+	if want := "hello| world"; string(body) != want {
+		t.Fatalf("got %q, want %q", body, want)
+	}
+}
+
+func TestStreamRequestBodyReset(t *testing.T) {
+	readErr := make(chan error, 1)
+
+	s := &Server{
+		s: &fasthttp.Server{
+			StreamRequestBody: true,
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				_, err := io.ReadAll(ctx.Request.BodyStream())
+				readErr <- err
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	c.writeFrame(makeHeadersOrdered(3, c.enc, true, false, [][2]string{
+		{":method", "POST"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+	}))
+
+	if err := writeDataFrame(c, 3, false, []byte("partial")); err != nil {
+		t.Fatal(err)
+	}
+
+	// cancel the stream mid-body: the handler's read must fail instead of
+	// blocking forever
+	fr := AcquireFrameHeader()
+	fr.SetStream(3)
+	rst := AcquireFrame(FrameResetStream).(*RstStream)
+	rst.SetCode(StreamCanceled)
+	fr.SetBody(rst)
+	c.writeFrame(fr)
+
+	select {
+	case err := <-readErr:
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("expected ErrUnexpectedEOF, got %v", err)
+		}
+	case <-time.After(time.Second * 5):
+		t.Fatal("the handler stayed blocked on the reset stream's body")
+	}
+
+	// the connection must survive and serve the next request
+	c.writeFrame(makeHeadersOrdered(5, c.enc, true, false, [][2]string{
+		{":method", "POST"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+	}))
+
+	if err := writeDataFrame(c, 5, true, []byte("full")); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-readErr:
+		if err != nil {
+			t.Fatalf("expected a complete body, got %v", err)
+		}
+	case <-time.After(time.Second * 5):
+		t.Fatal("the second request never reached the handler")
+	}
+
+	fr = readNextOn(t, c, 5)
+	if fr.Type() != FrameHeaders {
+		t.Fatalf("expected HEADERS on stream 5, got %s", fr.Type())
+	}
+	ReleaseFrameHeader(fr)
+}
+
+func TestStreamRequestBodyTrailers(t *testing.T) {
+	s := &Server{
+		s: &fasthttp.Server{
+			StreamRequestBody: true,
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				body, err := io.ReadAll(ctx.Request.BodyStream())
+				if err != nil {
+					ctx.Error(err.Error(), fasthttp.StatusInternalServerError)
+					return
+				}
+
+				// past EOF the trailer fields are visible on the header
+				fmt.Fprintf(ctx, "body=%s;x-checksum=%s;trailers=",
+					body, ctx.Request.Header.Peek("x-checksum"))
+				for _, k := range ctx.Request.Header.PeekTrailerKeys() {
+					fmt.Fprintf(ctx, "[%s]", k)
+				}
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	c.writeFrame(makeHeadersOrdered(3, c.enc, true, false, [][2]string{
+		{":method", "POST"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+		{"content-length", "5"},
+	}))
+
+	if err := writeDataFrame(c, 3, false, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+
+	c.writeFrame(makeHeadersOrdered(3, c.enc, true, true, [][2]string{
+		{"x-checksum", "abc"},
+	}))
+
+	var body []byte
+	for {
+		fr := readNextOn(t, c, 3)
+
+		if fr.Type() == FrameData {
+			body = append(body, fr.Body().(*Data).Data()...)
+		}
+
+		done := fr.Flags().Has(FlagEndStream)
+		ReleaseFrameHeader(fr)
+
+		if done {
+			break
+		}
+	}
+
+	want := "body=hello;x-checksum=abc;trailers=[X-Checksum]"
+	if string(body) != want {
+		t.Fatalf("handler saw %q, want %q", body, want)
+	}
+}
+
+func TestStreamRequestBodyEarlyResponse(t *testing.T) {
+	s := &Server{
+		s: &fasthttp.Server{
+			StreamRequestBody: true,
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				// respond without touching the body
+				ctx.WriteString("done")
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	c.writeFrame(makeHeadersOrdered(3, c.enc, true, false, [][2]string{
+		{":method", "POST"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+		{"content-length", "1048576"},
+	}))
+
+	// the response arrives before the body was even sent, and the server
+	// asks the client to stop uploading with a NO_ERROR reset
+	var sawReset bool
+	for {
+		fr := readNextOn(t, c, 3)
+
+		if fr.Type() == FrameResetStream {
+			if code := fr.Body().(*RstStream).Code(); code != NoError {
+				t.Fatalf("expected NO_ERROR reset, got %s", code)
+			}
+
+			sawReset = true
+			ReleaseFrameHeader(fr)
+
+			break
+		}
+
+		ReleaseFrameHeader(fr)
+	}
+
+	if !sawReset {
+		t.Fatal("expected the early response to reset the stream")
+	}
+
+	// the rest of the upload, in flight before the reset was seen, must
+	// be tolerated
+	if err := writeDataFrame(c, 3, false, []byte("late payload")); err != nil {
+		t.Fatal(err)
+	}
+
+	// and the connection still serves requests
+	c.writeFrame(makeHeadersOrdered(5, c.enc, true, true, [][2]string{
+		{":method", "GET"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+	}))
+
+	for _, expect := range []FrameType{FrameHeaders, FrameData} {
+		fr := readNextOn(t, c, 5)
+
+		if fr.Type() != expect {
+			t.Fatalf("expected %s on stream 5, got %s", expect, fr.Type())
+		}
+
+		ReleaseFrameHeader(fr)
+	}
+}

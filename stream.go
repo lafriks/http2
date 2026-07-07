@@ -60,6 +60,18 @@ type Stream struct {
 	// dispatched before all their fields are decoded
 	endStreamPending bool
 
+	// dispatched marks a stream whose handler already runs on its own
+	// goroutine, reading the body from the pipe while the DATA frames
+	// are still arriving (Server.StreamRequestBody); the response is
+	// written when the handler comes back through handlerDone. While
+	// dispatched, the frame loop must not touch strm.ctx: the handler
+	// owns it.
+	dispatched bool
+	// body is the pipe feeding a dispatched handler
+	body *requestBody
+	// recvBody counts the DATA payload bytes received on the stream
+	recvBody int64
+
 	// header validation state (RFC 9113, sections 8.1 to 8.3)
 	pseudoSeen         uint8
 	regularHeadersSeen bool
@@ -111,6 +123,9 @@ func NewStream(id uint32, win int32) *Stream {
 	strm.headersFinished = false
 	strm.trailers = false
 	strm.endStreamPending = false
+	strm.dispatched = false
+	strm.body = nil
+	strm.recvBody = 0
 	strm.startedAt = time.Time{}
 	strm.previousHeaderBytes = strm.previousHeaderBytes[:0]
 	strm.ctx = nil

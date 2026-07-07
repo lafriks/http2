@@ -75,6 +75,17 @@ type serverConn struct {
 	// considered stalled and closed
 	writeTimeout time.Duration
 
+	// streamRequestBody mirrors fasthttp.Server.StreamRequestBody: the
+	// handler starts as soon as the request headers are complete and
+	// reads the body from a bounded pipe while its DATA frames are still
+	// in flight
+	streamRequestBody bool
+	// handlerDone returns the streams whose dispatched handler finished,
+	// so the frame loop writes the response with its single-goroutine
+	// HPACK encoder. Buffered to the stream limit: handlers never block
+	// on it, even when the frame loop is already gone.
+	handlerDone chan *Stream
+
 	// maxRequestBodySize limits how much of a request body is buffered,
 	// mirroring fasthttp.Server.MaxRequestBodySize
 	maxRequestBodySize int
@@ -140,6 +151,7 @@ func (sc *serverConn) Serve() error {
 	sc.closer = make(chan struct{}, 1)
 	sc.maxRequestTimer = time.NewTimer(0)
 	sc.clientWindow = int64(sc.clientS.MaxWindowSize())
+	sc.handlerDone = make(chan *Stream, sc.st.maxStreams)
 
 	// create the timer before spawning the writeLoop and readLoop
 	// goroutines: they and the timer callback read sc.pingTimer, so a
@@ -468,13 +480,31 @@ func (sc *serverConn) handleStreams() {
 		rememberClosed(strm.ID(), strm.resetByServer)
 		strms.Del(strm.ID())
 
-		ctxPool.Put(strm.ctx)
-		streamPool.Put(strm)
+		if strm.dispatched {
+			// the handler is still running and owns the ctx: end its
+			// body pipe and let the handlerDone case do the recycling
+			strm.body.closeWithError(io.ErrUnexpectedEOF)
+		} else {
+			ctxPool.Put(strm.ctx)
+			streamPool.Put(strm)
+		}
 
 		if sc.debug {
 			sc.logger.Printf("Stream destroyed %d. Open streams: %d\n", strmID, openStreams)
 		}
 	}
+
+	// the body pipes of the handlers still running when the connection
+	// goes away must be ended, so their reads don't stay blocked forever;
+	// the streams themselves are reclaimed by the GC, since nobody
+	// consumes handlerDone anymore
+	defer func() {
+		for _, strm := range strms {
+			if strm.dispatched {
+				strm.body.closeWithError(io.ErrUnexpectedEOF)
+			}
+		}
+	}()
 
 	// receiving on a nil channel blocks forever, so disabling a case
 	// after its first (and only) receive is enough
@@ -512,9 +542,68 @@ func (sc *serverConn) handleStreams() {
 		sc.writeFrame(closeConnSentinel)
 	}
 
+	// maybeCloseAfterShutdown closes the connection while it's draining
+	// (a closing GOAWAY has been sent) once every stream accepted before
+	// the GOAWAY has been served.
+	maybeCloseAfterShutdown := func() {
+		ref := atomic.LoadUint32(&sc.closeRef)
+		if ref == 0 {
+			return
+		}
+
+		for _, strm := range strms {
+			// if the stream is here, then it's not closed yet
+			if strm.origType == FrameHeaders && strm.ID() <= ref {
+				return
+			}
+		}
+
+		// all streams served: flush what's pending and close the
+		// connection; readLoop then ends and the regular teardown
+		// closes this loop through sc.reader
+		sc.writeFrame(closeConnSentinel)
+	}
+
 loop:
 	for {
 		select {
+		case strm := <-sc.handlerDone:
+			strm.dispatched = false
+
+			if strm.State() == StreamStateClosed {
+				// the stream ended while the handler was running:
+				// closeStream already did the accounting and ended the
+				// body pipe, only the recycling waited for the handler
+				// to let go of the ctx
+				ctxPool.Put(strm.ctx)
+				streamPool.Put(strm)
+
+				continue loop
+			}
+
+			// nothing consumes the body anymore
+			strm.body.closeWithError(errBodyStreamClosed)
+
+			sc.writeResponse(strm)
+
+			completed := strm.State() == StreamStateHalfClosed
+			strm.SetState(StreamStateClosed)
+
+			if !completed {
+				// the handler responded before the request body ended:
+				// ask the client to stop sending with a RST_STREAM
+				// carrying NO_ERROR (RFC 9113, section 8.1.1); the
+				// frames still in flight are absorbed by the reset
+				// tolerance
+				strm.resetByServer = true
+				sc.writeReset(strm.ID(), NoError)
+			}
+
+			closeStream(strm)
+
+			if atomic.LoadInt32((*int32)(&sc.state)) == int32(connStateClosed) {
+				maybeCloseAfterShutdown()
+			}
 		case <-closerCh:
 			closerCh = nil
 			// the GOAWAY has been queued by closeIdleConn already; closing
@@ -767,7 +856,9 @@ loop:
 			// reset tolerance above. The header block must be complete
 			// first, though: aborting in the middle of it would stop
 			// decoding the remaining fragments and desync the HPACK tables.
-			if (strm.tooLargeBody || strm.tooLargeHeaders) &&
+			// A dispatched stream is excluded: its handler already runs,
+			// the over-limit body surfaced as its read error.
+			if (strm.tooLargeBody || strm.tooLargeHeaders) && !strm.dispatched &&
 				strm.headersFinished && strm.State() == StreamStateOpen {
 				sc.handleEndRequest(strm)
 
@@ -778,6 +869,13 @@ loop:
 
 			switch strm.State() {
 			case StreamStateHalfClosed:
+				if strm.dispatched {
+					// the request is complete: signal EOF to the handler;
+					// the response follows through handlerDone
+					strm.body.closeWithError(io.EOF)
+					break
+				}
+
 				sc.handleEndRequest(strm)
 				// we fallthrough because once we send the response
 				// the stream is already consumed and thus finished
@@ -787,24 +885,7 @@ loop:
 			}
 
 			if isClosing {
-				ref := atomic.LoadUint32(&sc.closeRef)
-				// if there's no reference, then just close the connection
-				if ref == 0 {
-					break
-				}
-
-				// if we have a ref, then check that all streams previous to that ref are closed
-				for _, strm := range strms {
-					// if the stream is here, then it's not closed yet
-					if strm.origType == FrameHeaders && strm.ID() <= ref {
-						continue loop
-					}
-				}
-
-				// all streams served: flush what's pending and close the
-				// connection; readLoop then ends and the regular teardown
-				// closes this loop through sc.reader
-				sc.writeFrame(closeConnSentinel)
+				maybeCloseAfterShutdown()
 			}
 		}
 	}
@@ -1021,7 +1102,7 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 					// (RFC 9113, section 8.1.1)
 					if !strm.tooLargeBody &&
 						strm.expectedContentLength >= 0 &&
-						strm.expectedContentLength != int64(len(strm.ctx.Request.Body())) {
+						strm.expectedContentLength != strm.recvBody {
 
 						return NewResetStreamError(ProtocolError, "content-length header field does not match the DATA payload")
 					}
@@ -1045,6 +1126,14 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 				if strm.expectedContentLength > int64(sc.maxRequestBodySize) {
 					strm.tooLargeBody = true
 				}
+
+				// with StreamRequestBody the handler starts now and reads
+				// the body while its DATA frames are still arriving;
+				// bodyless requests and the ones already rejected (413)
+				// keep the buffered path
+				if sc.streamRequestBody && !strm.tooLargeBody && !strm.endStreamPending {
+					sc.dispatchStream(strm)
+				}
 			}
 		}
 	case FrameData:
@@ -1056,11 +1145,25 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 			return NewGoAwayError(StreamClosedError, "stream closed")
 		}
 
-		sc.applyDataFlowControl(fr, true)
+		// a dispatched handler consumes the body through the pipe, and its
+		// stream window is only refunded as the handler reads (that's the
+		// backpressure); otherwise the window refills right away
+		sc.applyDataFlowControl(fr, !strm.dispatched)
 
 		data := fr.Body().(*Data).Data()
+		strm.recvBody += int64(len(data))
 
 		switch {
+		case strm.dispatched:
+			// same limit as the buffered path: the handler's reads fail
+			// with ErrBodyTooLarge, and the withheld window refunds
+			// stall the rest of the upload
+			if !strm.tooLargeBody && strm.recvBody > int64(sc.maxRequestBodySize) {
+				strm.tooLargeBody = true
+				strm.body.closeWithError(fasthttp.ErrBodyTooLarge)
+			}
+
+			strm.body.write(data)
 		case strm.tooLargeBody:
 			// drain the rest of the body without buffering it; the
 			// flow-control accounting above keeps the windows correct
@@ -1078,7 +1181,7 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 		if fr.Flags().Has(FlagEndStream) &&
 			!strm.tooLargeBody &&
 			strm.expectedContentLength >= 0 &&
-			strm.expectedContentLength != int64(len(strm.ctx.Request.Body())) {
+			strm.expectedContentLength != strm.recvBody {
 
 			return NewResetStreamError(ProtocolError, "content-length header field does not match the DATA payload")
 		}
@@ -1199,7 +1302,11 @@ func (sc *serverConn) handleHeaderFrame(strm *Stream, fr *FrameHeader) error {
 				continue
 			}
 
-			validateTrailerField(strm, req, k, v)
+			if strm.dispatched {
+				validateStreamedTrailerField(strm, k, v)
+			} else {
+				validateTrailerField(strm, req, k, v)
+			}
 
 			continue
 		}
@@ -1368,6 +1475,22 @@ func validateTrailerField(strm *Stream, req *fasthttp.Request, k, v []byte) {
 	req.Header.AddBytesKV(k, v)
 }
 
+// validateStreamedTrailerField checks and stashes a trailer field of a
+// stream whose handler is already running: the handler owns the request
+// header, so the field is parked on the body pipe and applied from the
+// handler's side when the body reaches EOF. The forbidden-in-trailers
+// check happens there too, surfacing as a body read error.
+func validateStreamedTrailerField(strm *Stream, k, v []byte) {
+	for _, c := range k {
+		if 'A' <= c && c <= 'Z' {
+			strm.recordViolation("uppercase header field name")
+			return
+		}
+	}
+
+	strm.body.addTrailer(k, v)
+}
+
 // validateRequestHeaders enforces the rules that can only be checked once
 // the header block ends: mandatory pseudo-header fields (RFC 9113, section
 // 8.3.1) and a content-length coherent with END_STREAM (section 8.1.1).
@@ -1420,6 +1543,36 @@ func (sc *serverConn) verifyState(strm *Stream, fr *FrameHeader) error {
 	return nil
 }
 
+// dispatchStream starts the handler of a stream whose body is still in
+// flight (Server.StreamRequestBody): the handler reads the body from a
+// pipe the frame loop feeds, and the response is written once the handler
+// comes back through handlerDone.
+func (sc *serverConn) dispatchStream(strm *Stream) {
+	strm.dispatched = true
+	strm.body = newRequestBody(sc, strm.ID(), &strm.ctx.Request)
+
+	ctx := strm.ctx
+	ctx.Request.Header.SetProtocolBytes(StringHTTP2)
+	ctx.Request.SetBodyStream(strm.body, int(strm.expectedContentLength))
+
+	if sc.debug {
+		sc.logger.Printf("Stream %d dispatched with the body in flight\n", strm.ID())
+	}
+
+	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				sc.logger.Printf("handler panicked: %s\n%s\n", err, debug.Stack())
+				ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
+			}
+
+			sc.handlerDone <- strm
+		}()
+
+		sc.h(ctx)
+	}()
+}
+
 // handleEndRequest dispatches the finished request to the handler.
 func (sc *serverConn) handleEndRequest(strm *Stream) {
 	ctx := strm.ctx
@@ -1443,6 +1596,15 @@ func (sc *serverConn) handleEndRequest(strm *Stream) {
 	default:
 		sc.h(ctx)
 	}
+
+	sc.writeResponse(strm)
+}
+
+// writeResponse encodes and queues the response of a served stream:
+// headers, body and the announced trailers. It must run on the
+// handleStreams goroutine, which owns the HPACK encoder.
+func (sc *serverConn) writeResponse(strm *Stream) {
+	ctx := strm.ctx
 
 	hasBody := ctx.Response.IsBodyStream() || len(ctx.Response.Body()) > 0
 	// fields announced with Response.Header.SetTrailer/AddTrailer are sent
