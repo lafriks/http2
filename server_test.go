@@ -331,6 +331,94 @@ func TestServerResetToleratesInFlightFrames(t *testing.T) {
 	}
 }
 
+func TestUnknownFrameTypeIgnored(t *testing.T) {
+	s := newShutdownServer(time.Millisecond * 50)
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	// a frame of unknown type must be ignored and discarded
+	// (RFC 9113, section 4.1): length 4, type 0xdd, flags 0, stream 0
+	raw := []byte{0x00, 0x00, 0x04, 0xdd, 0x00, 0x00, 0x00, 0x00, 0x00, 'w', 'a', 'a', 't'}
+	if _, err := c.bw.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	c.bw.Flush()
+
+	// the connection must remain fully usable: no GOAWAY, requests served
+	h1 := makeHeaders(3, c.enc, true, true, map[string]string{
+		string(StringAuthority): "localhost",
+		string(StringMethod):    "GET",
+		string(StringPath):      "/",
+		string(StringScheme):    "https",
+	})
+	c.writeFrame(h1)
+
+	for _, expect := range []FrameType{FrameHeaders, FrameData} {
+		fr, err := c.readNext()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if fr.Type() != expect || fr.Stream() != 3 {
+			t.Fatalf("expected %s on stream 3, got %s on %d", expect, fr.Type(), fr.Stream())
+		}
+
+		ReleaseFrameHeader(fr)
+	}
+}
+
+func TestFatalErrorClosesConnection(t *testing.T) {
+	s := newShutdownServer(time.Millisecond * 50)
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	// a PING carrying a stream ID is a connection error: the server must
+	// announce it with a GOAWAY and then actually close the connection
+	// (RFC 9113, section 5.4.1)
+	fr := AcquireFrameHeader()
+	fr.SetStream(3)
+	fr.SetBody(AcquireFrame(FramePing))
+	if _, err := fr.WriteTo(c.bw); err != nil {
+		t.Fatal(err)
+	}
+	c.bw.Flush()
+	ReleaseFrameHeader(fr)
+
+	// readNext returns connection-level GOAWAYs as an error
+	_, err = c.readNext()
+	ga, ok := err.(*GoAway)
+	if !ok {
+		t.Fatalf("expected GoAway, got %v", err)
+	}
+
+	if ga.Code() != ProtocolError {
+		t.Fatalf("expected ProtocolError, got %s", ga.Code())
+	}
+
+	// and the connection must be closed by the server
+	if _, err := c.readNext(); err == nil {
+		t.Fatal("expected the connection to be closed")
+	}
+}
+
 func TestRequestHeaderSizeLimit(t *testing.T) {
 	var handled int
 	s := &Server{

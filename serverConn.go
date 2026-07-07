@@ -277,6 +277,17 @@ func (sc *serverConn) checkFrameWithStream(fr *FrameHeader) error {
 	return nil
 }
 
+// fatalConnError reports a connection error (RFC 9113, section 5.4.1):
+// the GOAWAY carrying the code is queued, the writeLoop flushes it and
+// closes the connection, and the incoming bytes are drained until the
+// connection dies so the teardown can't cut the GOAWAY short.
+func (sc *serverConn) fatalConnError(code ErrorCode, message string) {
+	sc.writeGoAway(0, code, message)
+	sc.writeFrame(closeConnSentinel)
+
+	_, _ = io.Copy(io.Discard, sc.br)
+}
+
 func (sc *serverConn) readLoop() (err error) {
 	defer func() {
 		if err := recover(); err != nil {
@@ -286,11 +297,25 @@ func (sc *serverConn) readLoop() (err error) {
 
 	var fr *FrameHeader
 
+	// non-zero while a header block awaits its CONTINUATION frames: a
+	// header block must be a contiguous run of HEADERS/CONTINUATION frames
+	// (RFC 9113, section 4.3)
+	var headerBlockStream uint32
+
 	for err == nil {
 		fr, err = ReadFrameFromWithSize(sc.br, sc.clientS.frameSize)
 		if err != nil {
 			if errors.Is(err, ErrUnknownFrameType) {
-				sc.writeGoAway(0, ProtocolError, "unknown frame type")
+				// RFC 9113 (section 4.1): frames of unknown type MUST be
+				// ignored and discarded (the reader already discarded the
+				// payload, keeping the stream aligned), unless one arrives
+				// in the middle of a header block, which breaks the
+				// required contiguity (section 4.3)
+				if headerBlockStream != 0 {
+					err = NewGoAwayError(ProtocolError, "unknown frame in the middle of a header block")
+					break
+				}
+
 				err = nil
 				continue
 			}
@@ -299,12 +324,22 @@ func (sc *serverConn) readLoop() (err error) {
 		}
 
 		if fr.Stream() != 0 {
-			err := sc.checkFrameWithStream(fr)
-			if err != nil {
-				sc.writeError(nil, err)
-			} else {
-				sc.reader <- fr
+			if cerr := sc.checkFrameWithStream(fr); cerr != nil {
+				ReleaseFrameHeader(fr)
+				err = cerr
+				break
 			}
+
+			// track header-block continuity for the unknown-frame check
+			if t := fr.Type(); t == FrameHeaders || t == FrameContinuation {
+				if fr.Flags().Has(FlagEndHeaders) {
+					headerBlockStream = 0
+				} else {
+					headerBlockStream = fr.Stream()
+				}
+			}
+
+			sc.reader <- fr
 
 			continue
 		}
@@ -319,13 +354,9 @@ func (sc *serverConn) readLoop() (err error) {
 		case FrameWindowUpdate:
 			win := int64(fr.Body().(*WindowUpdate).Increment())
 			if win == 0 {
-				sc.writeGoAway(0, ProtocolError, "window increment of 0")
-				// return
-				continue
-			}
-
-			if atomic.AddInt64(&sc.clientWindow, win) >= 1<<31-1 {
-				sc.writeGoAway(0, FlowControlError, "window is above limits")
+				err = NewGoAwayError(ProtocolError, "window increment of 0")
+			} else if atomic.AddInt64(&sc.clientWindow, win) >= 1<<31-1 {
+				err = NewGoAwayError(FlowControlError, "window is above limits")
 			}
 		case FramePing:
 			ping := fr.Body().(*Ping)
@@ -345,10 +376,17 @@ func (sc *serverConn) readLoop() (err error) {
 				err = fmt.Errorf("goaway: %s: %s", ga.Code(), ga.Data())
 			}
 		default:
-			sc.writeGoAway(0, ProtocolError, "invalid frame")
+			err = NewGoAwayError(ProtocolError, "invalid frame")
 		}
 
 		ReleaseFrameHeader(fr)
+	}
+
+	// connection errors carry an error code: announce it with a GOAWAY
+	// and make sure the connection closes (RFC 9113, section 5.4.1)
+	connErr := Error{}
+	if errors.As(err, &connErr) {
+		sc.fatalConnError(connErr.Code(), connErr.Error())
 	}
 
 	return

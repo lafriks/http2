@@ -193,7 +193,11 @@ func (f *FrameHeader) readFrom(br *bufio.Reader) (int64, error) {
 		return 0, err
 	}
 
-	if f.kind > FrameContinuation {
+	// FrameType is int8, so frame type bytes >= 0x80 parse as negative;
+	// both those and types above FrameContinuation are unknown and must
+	// be discarded (RFC 9113, section 4.1) instead of indexing the pool
+	// with an out-of-range type.
+	if f.kind < 0 || f.kind > FrameContinuation {
 		_, _ = br.Discard(f.length)
 		return 0, ErrUnknownFrameType
 	}
