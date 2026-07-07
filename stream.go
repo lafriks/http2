@@ -1,6 +1,7 @@
 package http2
 
 import (
+	"io"
 	"sync"
 	"time"
 
@@ -35,7 +36,13 @@ func (ss StreamState) String() string {
 }
 
 type Stream struct {
-	id                  uint32
+	id uint32
+	// window tracks the peer's per-stream send window relative to its
+	// INITIAL_WINDOW_SIZE: WINDOW_UPDATEs add to it and sent DATA
+	// subtracts, so the available window is clientInitialWindow + window
+	// at any moment — which is exactly the RFC 9113 (section 6.9.2)
+	// semantics for INITIAL_WINDOW_SIZE changes, retroactive ones and
+	// negative windows included.
 	window              int64
 	state               StreamState
 	ctx                 *fasthttp.RequestCtx
@@ -71,6 +78,28 @@ type Stream struct {
 	body *requestBody
 	// recvBody counts the DATA payload bytes received on the stream
 	recvBody int64
+
+	// response send state, flow controlled by the peer's windows
+	// (RFC 9113, section 5.2):
+	//
+	// sending marks a stream whose response body hasn't been fully
+	// queued yet; the stream stays alive until the peer's windows let
+	// the rest through
+	sending bool
+	// sendBody is the unsent remainder of a buffered response body
+	sendBody []byte
+	// sendReader sources a streamed response body; sendSize is what
+	// remains of its declared size, or negative when unknown
+	sendReader io.Reader
+	sendSize   int64
+	// sendDone marks the body fully queued, END_STREAM included
+	sendDone bool
+	// sendTrailer keeps the trailer HEADERS for after the body
+	sendTrailer bool
+	// afterSendReset asks for a NO_ERROR reset once the response has
+	// drained: the request body was still in flight when the handler
+	// answered
+	afterSendReset bool
 
 	// header validation state (RFC 9113, sections 8.1 to 8.3)
 	pseudoSeen         uint8
@@ -126,6 +155,13 @@ func NewStream(id uint32, win int32) *Stream {
 	strm.dispatched = false
 	strm.body = nil
 	strm.recvBody = 0
+	strm.sending = false
+	strm.sendBody = nil
+	strm.sendReader = nil
+	strm.sendSize = 0
+	strm.sendDone = false
+	strm.sendTrailer = false
+	strm.afterSendReset = false
 	strm.startedAt = time.Time{}
 	strm.previousHeaderBytes = strm.previousHeaderBytes[:0]
 	strm.ctx = nil

@@ -2048,6 +2048,19 @@ func TestWriteTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// open the flow-control windows wide: this test is about the TCP
+	// write stalling, so the windows must never be the limit
+	if err := writeRawSettings(c, MaxWindowSize, 1<<30); err != nil {
+		t.Fatal(err)
+	}
+
+	wu := AcquireFrameHeader()
+	wu.SetBody(AcquireFrame(FrameWindowUpdate))
+	wu.Body().(*WindowUpdate).SetIncrement(1 << 30)
+	if err := c.writeFrame(wu); err != nil {
+		t.Fatal(err)
+	}
+
 	// the client sends a request and never reads the response: the write
 	// deadline must tear the connection down instead of blocking forever
 	_ = c.writeFrame(makeHeaders(3, c.enc, true, true, map[string]string{
@@ -2445,4 +2458,126 @@ func TestStreamRequestBodyEarlyResponse(t *testing.T) {
 
 		ReleaseFrameHeader(fr)
 	}
+}
+
+// writeRawSettings sends a SETTINGS frame carrying a single setting.
+func writeRawSettings(c *Conn, id uint16, value uint32) error {
+	raw := []byte{
+		0x00, 0x00, 0x06, // length 6
+		byte(FrameSettings),    // type
+		0x00,                   // flags
+		0x00, 0x00, 0x00, 0x00, // stream 0
+		byte(id >> 8), byte(id),
+		byte(value >> 24), byte(value >> 16), byte(value >> 8), byte(value),
+	}
+
+	if _, err := c.bw.Write(raw); err != nil {
+		return err
+	}
+
+	return c.bw.Flush()
+}
+
+// writeStreamWindowUpdate grants the server more per-stream send window.
+func writeStreamWindowUpdate(c *Conn, id uint32, increment int) error {
+	fr := AcquireFrameHeader()
+	fr.SetStream(id)
+
+	wu := AcquireFrame(FrameWindowUpdate).(*WindowUpdate)
+	wu.SetIncrement(increment)
+	fr.SetBody(wu)
+
+	return c.writeFrame(fr)
+}
+
+// runResponseFlowControlTest shrinks the stream window to 4 bytes and
+// checks that the 10-byte response arrives in window-sized DATA frames,
+// each next one released by a WINDOW_UPDATE.
+func runResponseFlowControlTest(t *testing.T, s *Server) {
+	t.Helper()
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writeRawSettings(c, MaxWindowSize, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	c.writeFrame(makeHeadersOrdered(3, c.enc, true, true, [][2]string{
+		{":method", "GET"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+	}))
+
+	fr := readNextOn(t, c, 3)
+	if fr.Type() != FrameHeaders {
+		t.Fatalf("expected HEADERS, got %s", fr.Type())
+	}
+	ReleaseFrameHeader(fr)
+
+	var body []byte
+	for {
+		fr = readNextOn(t, c, 3)
+
+		if fr.Type() != FrameData {
+			t.Fatalf("expected DATA, got %s", fr.Type())
+		}
+
+		data := fr.Body().(*Data).Data()
+		if len(data) > 4 {
+			t.Fatalf("DATA frame of %d bytes exceeds the 4-byte window", len(data))
+		}
+
+		body = append(body, data...)
+
+		done := fr.Flags().Has(FlagEndStream)
+		ReleaseFrameHeader(fr)
+
+		if done {
+			break
+		}
+
+		// release the next window-sized chunk
+		if err := writeStreamWindowUpdate(c, 3, 4); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if want := "0123456789"; string(body) != want {
+		t.Fatalf("got body %q, want %q", body, want)
+	}
+}
+
+func TestResponseFlowControl(t *testing.T) {
+	runResponseFlowControlTest(t, &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				ctx.WriteString("0123456789")
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	})
+}
+
+func TestResponseFlowControlStreamedBody(t *testing.T) {
+	runResponseFlowControlTest(t, &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
+					_, _ = w.WriteString("0123456789")
+				})
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	})
 }

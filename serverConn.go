@@ -44,9 +44,18 @@ type serverConn struct {
 	// last valid ID used as a reference for new IDs
 	lastID uint32
 
-	// client's window
-	// should be int64 because the user can try to overflow it
+	// clientWindow is the connection-level send window: what the peer
+	// can still receive. It starts at 65535 (RFC 9113, section 6.9.2:
+	// INITIAL_WINDOW_SIZE never changes the connection window), grows
+	// with the peer's WINDOW_UPDATEs and shrinks with the DATA sent.
+	// int64 because the user can try to overflow it.
 	clientWindow int64
+	// clientInitialWindow is the peer's SETTINGS_INITIAL_WINDOW_SIZE:
+	// the base of every stream's send window (see Stream.window)
+	clientInitialWindow int64
+	// windowPoke wakes handleStreams when the connection window or the
+	// peer's INITIAL_WINDOW_SIZE moved, so stalled responses get retried
+	windowPoke chan struct{}
 
 	// our values
 	maxWindow     int32
@@ -150,7 +159,9 @@ func (sc *serverConn) Handshake() error {
 func (sc *serverConn) Serve() error {
 	sc.closer = make(chan struct{}, 1)
 	sc.maxRequestTimer = time.NewTimer(0)
-	sc.clientWindow = int64(sc.clientS.MaxWindowSize())
+	sc.clientWindow = 65535
+	sc.clientInitialWindow = 65535
+	sc.windowPoke = make(chan struct{}, 1)
 	sc.handlerDone = make(chan *Stream, sc.st.maxStreams)
 
 	// create the timer before spawning the writeLoop and readLoop
@@ -385,6 +396,9 @@ func (sc *serverConn) readLoop() (err error) {
 				err = NewGoAwayError(ProtocolError, "window increment of 0")
 			} else if atomic.AddInt64(&sc.clientWindow, win) >= 1<<31-1 {
 				err = NewGoAwayError(FlowControlError, "window is above limits")
+			} else {
+				// the connection window grew: retry stalled responses
+				sc.pokeWindows()
 			}
 		case FramePing:
 			ping := fr.Body().(*Ping)
@@ -480,6 +494,19 @@ func (sc *serverConn) handleStreams() {
 		rememberClosed(strm.ID(), strm.resetByServer)
 		strms.Del(strm.ID())
 
+		if strm.sending {
+			// the response was cut short (a reset or the teardown):
+			// drop what's pending and release a body stream's blocked
+			// producer, if any
+			strm.sending = false
+			strm.sendBody = nil
+			strm.sendReader = nil
+
+			if strm.ctx.Response.IsBodyStream() {
+				_ = strm.ctx.Response.CloseBodyStream()
+			}
+		}
+
 		if strm.dispatched {
 			// the handler is still running and owns the ctx: end its
 			// body pipe and let the handlerDone case do the recycling
@@ -494,14 +521,38 @@ func (sc *serverConn) handleStreams() {
 		}
 	}
 
+	// finishResponse pumps a queued response as far as the peer's windows
+	// allow and, once it has been fully queued, finishes the stream: the
+	// deferred reset of early responses, then the close that recycles it.
+	// A stalled response leaves the stream alive until the peer opens its
+	// windows again.
+	finishResponse := func(strm *Stream) {
+		if !sc.pumpSend(strm) {
+			return
+		}
+
+		if strm.afterSendReset {
+			strm.resetByServer = true
+			sc.writeReset(strm.ID(), NoError)
+		}
+
+		strm.SetState(StreamStateClosed)
+		closeStream(strm)
+	}
+
 	// the body pipes of the handlers still running when the connection
 	// goes away must be ended, so their reads don't stay blocked forever;
-	// the streams themselves are reclaimed by the GC, since nobody
-	// consumes handlerDone anymore
+	// same for the producer of a stalled streamed response. The streams
+	// themselves are reclaimed by the GC, since nobody consumes
+	// handlerDone anymore.
 	defer func() {
 		for _, strm := range strms {
 			if strm.dispatched {
 				strm.body.closeWithError(io.ErrUnexpectedEOF)
+			}
+
+			if strm.sending && strm.ctx.Response.IsBodyStream() {
+				_ = strm.ctx.Response.CloseBodyStream()
 			}
 		}
 	}()
@@ -586,20 +637,30 @@ loop:
 
 			sc.writeResponse(strm)
 
-			completed := strm.State() == StreamStateHalfClosed
-			strm.SetState(StreamStateClosed)
-
-			if !completed {
+			if strm.State() != StreamStateHalfClosed {
 				// the handler responded before the request body ended:
-				// ask the client to stop sending with a RST_STREAM
-				// carrying NO_ERROR (RFC 9113, section 8.1.1); the
-				// frames still in flight are absorbed by the reset
-				// tolerance
-				strm.resetByServer = true
-				sc.writeReset(strm.ID(), NoError)
+				// once the response drains, ask the client to stop
+				// sending with a RST_STREAM carrying NO_ERROR (RFC 9113,
+				// section 8.1.1); the frames still in flight are
+				// absorbed by the reset tolerance
+				strm.afterSendReset = true
 			}
 
-			closeStream(strm)
+			finishResponse(strm)
+
+			if atomic.LoadInt32((*int32)(&sc.state)) == int32(connStateClosed) {
+				maybeCloseAfterShutdown()
+			}
+		case <-sc.windowPoke:
+			// the connection window or the peer's INITIAL_WINDOW_SIZE
+			// moved: retry the stalled responses. The snapshot keeps the
+			// iteration safe while finishResponse removes drained
+			// streams from strms.
+			for _, strm := range slices.Clone(strms) {
+				if strm.sending {
+					finishResponse(strm)
+				}
+			}
 
 			if atomic.LoadInt32((*int32)(&sc.state)) == int32(connStateClosed) {
 				maybeCloseAfterShutdown()
@@ -771,7 +832,9 @@ loop:
 					continue
 				}
 
-				strm = NewStream(fr.Stream(), int32(sc.clientWindow))
+				// the stream's send window starts at zero delta: the
+				// effective window is clientInitialWindow + delta
+				strm = NewStream(fr.Stream(), 0)
 				strms = append(strms, strm)
 
 				// RFC(5.1.1):
@@ -850,38 +913,51 @@ loop:
 
 			// a request over MaxRequestBodySize or with an over-limit
 			// header list doesn't need the rest of its body: answer with
-			// the 413/431 right away and ask the client to stop sending
-			// with a RST_STREAM carrying NO_ERROR (RFC 9113, section
-			// 8.1.1); the frames still in flight are absorbed by the
-			// reset tolerance above. The header block must be complete
-			// first, though: aborting in the middle of it would stop
-			// decoding the remaining fragments and desync the HPACK tables.
-			// A dispatched stream is excluded: its handler already runs,
-			// the over-limit body surfaced as its read error.
-			if (strm.tooLargeBody || strm.tooLargeHeaders) && !strm.dispatched &&
+			// the 413/431 right away and, once the response drains, ask
+			// the client to stop sending with a RST_STREAM carrying
+			// NO_ERROR (RFC 9113, section 8.1.1); the frames still in
+			// flight are absorbed by the reset tolerance above. The
+			// header block must be complete first, though: aborting in
+			// the middle of it would stop decoding the remaining
+			// fragments and desync the HPACK tables. A dispatched stream
+			// is excluded: its handler already runs, the over-limit body
+			// surfaced as its read error.
+			if (strm.tooLargeBody || strm.tooLargeHeaders) && !strm.dispatched && !strm.sending &&
 				strm.headersFinished && strm.State() == StreamStateOpen {
 				sc.handleEndRequest(strm)
+				strm.afterSendReset = true
+				finishResponse(strm)
+			} else {
+				switch strm.State() {
+				case StreamStateHalfClosed:
+					if strm.dispatched {
+						// the request is complete: signal EOF to the
+						// handler; the response follows through
+						// handlerDone
+						strm.body.closeWithError(io.EOF)
+						break
+					}
 
-				strm.resetByServer = true
-				sc.writeReset(strm.ID(), NoError)
-				strm.SetState(StreamStateClosed)
-			}
+					if strm.sending {
+						// the request completed while its early response
+						// was still draining: no reset needed anymore,
+						// and this frame may have opened the windows
+						strm.afterSendReset = false
+						finishResponse(strm)
+						break
+					}
 
-			switch strm.State() {
-			case StreamStateHalfClosed:
-				if strm.dispatched {
-					// the request is complete: signal EOF to the handler;
-					// the response follows through handlerDone
-					strm.body.closeWithError(io.EOF)
-					break
+					sc.handleEndRequest(strm)
+					finishResponse(strm)
+				case StreamStateClosed:
+					closeStream(strm)
+				default:
+					if strm.sending {
+						// a WINDOW_UPDATE may have opened the stream's
+						// window: keep the early response draining
+						finishResponse(strm)
+					}
 				}
-
-				sc.handleEndRequest(strm)
-				// we fallthrough because once we send the response
-				// the stream is already consumed and thus finished
-				fallthrough
-			case StreamStateClosed:
-				closeStream(strm)
 			}
 
 			if isClosing {
@@ -931,6 +1007,23 @@ func (sc *serverConn) applyDataFlowControl(fr *FrameHeader, streamAlive bool) {
 		sc.updateWindow(0, int(sc.maxWindow-sc.currentWindow))
 		sc.currentWindow = sc.maxWindow
 	}
+}
+
+// pokeWindows wakes handleStreams to retry the responses stalled on flow
+// control. Non-blocking: a pending poke already covers this one.
+func (sc *serverConn) pokeWindows() {
+	select {
+	case sc.windowPoke <- struct{}{}:
+	default:
+	}
+}
+
+// streamSendWindow is how much the peer can still receive on the stream:
+// its INITIAL_WINDOW_SIZE plus the stream's WINDOW_UPDATE/sent delta. It
+// can be negative after an INITIAL_WINDOW_SIZE decrease (RFC 9113,
+// section 6.9.2).
+func (sc *serverConn) streamSendWindow(strm *Stream) int64 {
+	return atomic.LoadInt64(&sc.clientInitialWindow) + atomic.LoadInt64(&strm.window)
 }
 
 // updateWindow sends a WINDOW_UPDATE to replenish the peer's send window
@@ -1164,6 +1257,9 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 			}
 
 			strm.body.write(data)
+		case strm.sending:
+			// the stream was already answered (an early response still
+			// draining): the rest of the request body is discarded
 		case strm.tooLargeBody:
 			// drain the rest of the body without buffering it; the
 			// flow-control accounting above keeps the windows correct
@@ -1207,7 +1303,7 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 			return NewGoAwayError(ProtocolError, "window increment of 0")
 		}
 
-		if atomic.AddInt64(&strm.window, win) >= 1<<31-1 {
+		if atomic.AddInt64(&strm.window, win)+atomic.LoadInt64(&sc.clientInitialWindow) >= 1<<31-1 {
 			return NewResetStreamError(FlowControlError, "window is above limits")
 		}
 	default:
@@ -1624,23 +1720,127 @@ func (sc *serverConn) writeResponse(strm *Stream) {
 
 	sc.writeFrame(fr)
 
-	if hasBody {
+	switch {
+	case hasBody:
+		// the body is flow controlled: it's queued here and pumped by
+		// finishResponse as far as the peer's windows allow
 		if ctx.Response.IsBodyStream() {
-			streamWriter := acquireStreamWrite()
-			streamWriter.strm = strm
-			streamWriter.writer = sc.writer
-			streamWriter.size = int64(ctx.Response.Header.ContentLength())
-			streamWriter.trailer = hasTrailer
-			_ = ctx.Response.BodyWriteTo(streamWriter)
-			releaseStreamWrite(streamWriter)
+			strm.sendReader = ctx.Response.BodyStream()
+			strm.sendSize = int64(ctx.Response.Header.ContentLength())
 		} else {
-			sc.writeData(strm, ctx.Response.Body(), !hasTrailer)
+			strm.sendBody = ctx.Response.Body()
+		}
+
+		strm.sendTrailer = hasTrailer
+		strm.sending = true
+	case hasTrailer:
+		// a trailer-only response: HEADERS frames aren't flow controlled
+		sc.writeTrailer(strm, &ctx.Response)
+	}
+}
+
+// pumpSend queues as much of the pending response body as the peer's
+// flow-control windows allow (RFC 9113, section 5.2), and the trailer
+// HEADERS once the body is done. It reports whether the response has been
+// fully queued; on false the rest waits for the next window event.
+func (sc *serverConn) pumpSend(strm *Stream) bool {
+	if !strm.sending {
+		return true
+	}
+
+	var buf []byte
+	if strm.sendReader != nil {
+		buf = copyBufPool.Get().([]byte)
+		defer copyBufPool.Put(buf) //nolint:staticcheck // buf is never resliced
+	}
+
+	for !strm.sendDone {
+		// the next chunk, bounded by the frame size and both windows
+		step := 1 << 14 // max frame size 16384
+		if win := sc.streamSendWindow(strm); win < int64(step) {
+			step = int(win)
+		}
+		if win := atomic.LoadInt64(&sc.clientWindow); win < int64(step) {
+			step = int(win)
+		}
+
+		var chunk []byte
+
+		switch {
+		case strm.sendReader != nil && strm.sendSize != 0:
+			if step <= 0 {
+				return false
+			}
+
+			if strm.sendSize > 0 && int64(step) > strm.sendSize {
+				step = int(strm.sendSize)
+			}
+
+			n, err := strm.sendReader.Read(buf[:step])
+			chunk = buf[:n]
+
+			if strm.sendSize > 0 {
+				strm.sendSize -= int64(n)
+			}
+
+			// EOF, a read error or a stalled reader all end the body:
+			// the client can't be left waiting on an open stream
+			if err != nil || n == 0 || strm.sendSize == 0 {
+				strm.sendReader = nil
+				strm.sendDone = true
+			}
+		case strm.sendReader == nil && len(strm.sendBody) > 0:
+			if step <= 0 {
+				return false
+			}
+
+			if step > len(strm.sendBody) {
+				step = len(strm.sendBody)
+			}
+
+			chunk = strm.sendBody[:step]
+			strm.sendBody = strm.sendBody[step:]
+			strm.sendDone = len(strm.sendBody) == 0
+		default:
+			// nothing (left) to send: only the closing empty DATA frame,
+			// which consumes no window
+			strm.sendDone = true
+		}
+
+		endStream := strm.sendDone && !strm.sendTrailer
+		if len(chunk) > 0 || endStream {
+			sc.sendDataFrame(strm.ID(), chunk, endStream)
+
+			n := int64(len(chunk))
+			atomic.AddInt64(&strm.window, -n)
+			atomic.AddInt64(&sc.clientWindow, -n)
 		}
 	}
 
-	if hasTrailer {
-		sc.writeTrailer(strm, &ctx.Response)
+	if strm.sendTrailer {
+		sc.writeTrailer(strm, &strm.ctx.Response)
+		strm.sendTrailer = false
 	}
+
+	strm.sending = false
+
+	return true
+}
+
+// sendDataFrame queues one DATA frame; the payload is copied into the
+// frame, so chunk can be reused right away.
+func (sc *serverConn) sendDataFrame(strmID uint32, chunk []byte, endStream bool) {
+	fr := AcquireFrameHeader()
+	fr.SetStream(strmID)
+
+	data := AcquireFrame(FrameData).(*Data)
+	data.SetEndStream(endStream)
+	data.SetPadding(false)
+	data.SetData(chunk)
+
+	fr.SetBody(data)
+
+	sc.writeFrame(fr)
 }
 
 // writeTrailer encodes the response fields announced as trailers into the
@@ -1674,159 +1874,7 @@ var (
 			return make([]byte, 1<<14) // max frame size 16384
 		},
 	}
-	streamWritePool = sync.Pool{
-		New: func() any {
-			return &streamWrite{}
-		},
-	}
 )
-
-type streamWrite struct {
-	size    int64
-	written int64
-	strm    *Stream
-	writer  chan<- *FrameHeader
-	// trailer suppresses END_STREAM on the last DATA frame: a trailer
-	// HEADERS frame ends the stream instead
-	trailer bool
-}
-
-func acquireStreamWrite() *streamWrite {
-	v := streamWritePool.Get()
-	if v == nil {
-		return &streamWrite{}
-	}
-	return v.(*streamWrite)
-}
-
-func releaseStreamWrite(streamWrite *streamWrite) {
-	streamWrite.Reset()
-	streamWritePool.Put(streamWrite)
-}
-
-func (s *streamWrite) Reset() {
-	s.size = 0
-	s.written = 0
-	s.strm = nil
-	s.writer = nil
-	s.trailer = false
-}
-
-func (s *streamWrite) Write(body []byte) (n int, err error) {
-	if (s.size <= 0 && s.written > 0) || (s.size > 0 && s.written >= s.size) {
-		return 0, errors.New("writer closed")
-	}
-
-	step := 1 << 14 // max frame size 16384
-
-	n = len(body)
-	s.written += int64(n)
-
-	end := s.size < 0 || s.written >= s.size
-	for i := 0; i < n; i += step {
-		if i+step >= n {
-			step = n - i
-		}
-
-		fr := AcquireFrameHeader()
-		fr.SetStream(s.strm.ID())
-
-		data := AcquireFrame(FrameData).(*Data)
-		data.SetEndStream(end && i+step == n && !s.trailer)
-		data.SetPadding(false)
-		data.SetData(body[i : step+i])
-
-		fr.SetBody(data)
-
-		s.writer <- fr
-	}
-
-	return len(body), nil
-}
-
-func (s *streamWrite) ReadFrom(r io.Reader) (num int64, err error) {
-	buf := copyBufPool.Get().([]byte)
-
-	if s.size < 0 {
-		lrSize := limitedReaderSize(r)
-		if lrSize >= 0 {
-			s.size = lrSize
-		}
-	}
-
-	var n int
-	for {
-		n, err = r.Read(buf[0:])
-		if n <= 0 && err == nil {
-			err = errors.New("BUG: io.Reader returned 0, nil")
-		}
-
-		// A read may return data together with io.EOF, so the bytes must be
-		// flushed before reacting to the error.
-		eof := errors.Is(err, io.EOF)
-		num += int64(n)
-		// The stream ends when the reader is exhausted or the declared size
-		// has been reached.
-		end := eof || (s.size >= 0 && num >= s.size)
-
-		// with trailers pending there's no point in an empty DATA frame:
-		// the trailer HEADERS frame ends the stream
-		if n > 0 || (end && !s.trailer) {
-			fr := AcquireFrameHeader()
-			fr.SetStream(s.strm.ID())
-
-			data := AcquireFrame(FrameData).(*Data)
-			data.SetEndStream(end && !s.trailer)
-			data.SetPadding(false)
-			data.SetData(buf[:n])
-			fr.SetBody(data)
-
-			s.writer <- fr
-		}
-
-		if end {
-			// io.EOF is the expected, non-error end of the stream.
-			if eof {
-				err = nil
-			}
-
-			break
-		}
-
-		if err != nil {
-			break
-		}
-	}
-
-	copyBufPool.Put(buf)
-
-	return num, err
-}
-
-func (sc *serverConn) writeData(strm *Stream, body []byte, endStream bool) {
-	step := 1 << 14 // max frame size 16384
-	if strm.window > 0 && step > int(strm.window) {
-		step = int(strm.window)
-	}
-
-	for i := 0; i < len(body); i += step {
-		if i+step >= len(body) {
-			step = len(body) - i
-		}
-
-		fr := AcquireFrameHeader()
-		fr.SetStream(strm.ID())
-
-		data := AcquireFrame(FrameData).(*Data)
-		data.SetEndStream(endStream && i+step == len(body))
-		data.SetPadding(false)
-		data.SetData(body[i : step+i])
-
-		fr.SetBody(data)
-
-		sc.writeFrame(fr)
-	}
-}
 
 func (sc *serverConn) sendPingAndSchedule() {
 	sc.writePing()
@@ -1886,8 +1934,11 @@ func (sc *serverConn) handleSettings(st *Settings) {
 	st.CopyTo(&sc.clientS)
 	sc.enc.SetMaxTableSize(sc.clientS.HeaderTableSize())
 
-	// atomically update the new window
-	atomic.StoreInt64(&sc.clientWindow, int64(sc.clientS.MaxWindowSize()))
+	// a changed INITIAL_WINDOW_SIZE applies to every stream, the open
+	// ones retroactively (RFC 9113, section 6.9.2); the send windows
+	// derive from this base, so storing it is the whole adjustment
+	atomic.StoreInt64(&sc.clientInitialWindow, int64(sc.clientS.MaxWindowSize()))
+	sc.pokeWindows()
 
 	fr := AcquireFrameHeader()
 
@@ -1944,12 +1995,4 @@ func isTrailerField(trailer [][]byte, k []byte) bool {
 	}
 
 	return false
-}
-
-func limitedReaderSize(r io.Reader) int64 {
-	lr, ok := r.(*io.LimitedReader)
-	if !ok {
-		return -1
-	}
-	return lr.N
 }

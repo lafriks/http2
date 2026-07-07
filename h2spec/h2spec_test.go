@@ -97,7 +97,7 @@ func runH2Spec(t *testing.T, streamRequestBody bool) {
 		{desc: "http2/4.3/3"},
 		{desc: "http2/5.1.1/1"},
 		{desc: "http2/5.1.1/2"},
-		// {desc: "http2/5.1.2/1"},
+		{desc: "http2/5.1.2/1"},
 		{desc: "http2/5.1/1"},
 		{desc: "http2/5.1/2"},
 		{desc: "http2/5.1/3"},
@@ -147,10 +147,8 @@ func runH2Spec(t *testing.T, streamRequestBody bool) {
 		{desc: "http2/6.9.1/1"},
 		{desc: "http2/6.9.1/2"},
 		{desc: "http2/6.9.1/3"},
-		// 6.9.2/1 and 6.9.2/2 need send-side flow control (respecting a
-		// reduced SETTINGS_INITIAL_WINDOW_SIZE), which isn't implemented yet.
-		// {desc: "http2/6.9.2/1"},
-		// {desc: "http2/6.9.2/2"},
+		{desc: "http2/6.9.2/1"},
+		{desc: "http2/6.9.2/2"},
 		{desc: "http2/6.9.2/3"},
 		{desc: "http2/6.9/1"},
 		{desc: "http2/6.9/2"},
