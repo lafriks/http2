@@ -143,9 +143,19 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 }
 
-// ServeConn starts serving a net.Conn as HTTP/2.
+// ServeConn serves a single net.Conn as HTTP/2 and blocks until the
+// connection closes. It expects the client to speak HTTP/2 directly
+// ("prior knowledge", RFC 9113 section 3.3): it fails on connections that
+// don't open with the HTTP/2 preface.
 //
-// This function will fail if the connection does not support the HTTP/2 protocol.
+// ConfigureServer wires ServeConn into fasthttp's TLS+ALPN negotiation,
+// which is the usual way in. ServeConn can also be called directly from a
+// user-owned accept loop to serve h2c (cleartext HTTP/2) — for example
+// behind a TLS-terminating load balancer, or for gRPC clients dialing with
+// insecure credentials. See examples/h2c.
+//
+// The HTTP/1.1 Upgrade mechanism (the "Upgrade: h2c" header of RFC 7540,
+// section 3.2) is not supported.
 func (s *Server) ServeConn(c net.Conn) error {
 	defer func() { _ = c.Close() }()
 

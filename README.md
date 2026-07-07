@@ -16,8 +16,10 @@ If you need any help to set up, contributing or understanding this repo, you can
 
 ## How to use the server?
 
-The server can only be used if your server supports TLS.
-Then, you can call [ConfigureServer](https://pkg.go.dev/github.com/lafriks/http2#ConfigureServer).
+The usual way in is TLS with ALPN negotiation: call
+[ConfigureServer](https://pkg.go.dev/github.com/lafriks/http2#ConfigureServer)
+and serve with TLS. (For cleartext HTTP/2 see [h2c](#h2c-cleartext-http2)
+below.)
 
 ```go
 package main
@@ -57,6 +59,40 @@ s.Shutdown()      // then stop the fasthttp server
 ```
 
 See [examples/simple](./examples/simple/main.go) for a complete example.
+
+### h2c (cleartext HTTP/2)
+
+`ConfigureServer` only wires HTTP/2 into fasthttp's TLS+ALPN negotiation,
+and the HTTP/1.1 Upgrade mechanism (`Upgrade: h2c`) is not supported.
+
+Prior-knowledge h2c works, though: clients that speak HTTP/2 directly over
+a plain TCP connection — gRPC clients with insecure credentials, or
+`curl --http2-prior-knowledge` — can be served by owning the accept loop
+and handing every connection to
+[ServeConn](https://pkg.go.dev/github.com/lafriks/http2#Server.ServeConn).
+This is the typical setup behind a TLS-terminating load balancer:
+
+```go
+s := &fasthttp.Server{Handler: yourHandler}
+h2s := http2.ConfigureServer(s, http2.ServerConfig{})
+
+ln, err := net.Listen("tcp", ":8080")
+if err != nil {
+    log.Fatalln(err)
+}
+
+for {
+    c, err := ln.Accept()
+    if err != nil {
+        break
+    }
+
+    // fails on connections that don't open with the HTTP/2 preface
+    go h2s.ServeConn(c)
+}
+```
+
+See [examples/h2c](./examples/h2c/main.go) for a complete example.
 
 ## How to use the client?
 
