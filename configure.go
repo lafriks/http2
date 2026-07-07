@@ -35,6 +35,32 @@ func configureDialer(d *Dialer) {
 }
 
 // ConfigureClient configures the fasthttp.HostClient to run over HTTP/2.
+//
+// It dials the host eagerly to negotiate HTTP/2 through TLS ALPN: it
+// returns ErrServerSupport when the server doesn't speak HTTP/2 (leaving
+// the HostClient on HTTP/1.1, with its TLS config restored), and it fails
+// when the host is unreachable. The client side requires TLS: there is no
+// cleartext (h2c) client, only the server supports h2c (see ServeConn).
+//
+// A fasthttp.Client (as opposed to a HostClient) can use HTTP/2 through
+// its ConfigureClient hook, treating ErrServerSupport as "stay on
+// HTTP/1.1":
+//
+//	c := &fasthttp.Client{
+//		ConfigureClient: func(hc *fasthttp.HostClient) error {
+//			err := http2.ConfigureClient(hc, http2.ClientOpts{})
+//			if errors.Is(err, http2.ErrServerSupport) {
+//				return nil // not an HTTP/2 host: it stays on HTTP/1.1
+//			}
+//			return err
+//		},
+//	}
+//
+// Mind that fasthttp invokes the hook — and therefore this eager dial —
+// under the client's internal host-map lock: the first request to a slow
+// or unreachable host delays the first request to every other host. That
+// is fine for a fixed set of known backends; latency-sensitive clients
+// talking to arbitrary hosts should stick to per-host HostClients.
 func ConfigureClient(c *fasthttp.HostClient, opts ClientOpts) error {
 	emptyServerName := c.TLSConfig != nil && c.TLSConfig.ServerName == ""
 

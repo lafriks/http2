@@ -7,7 +7,7 @@ Fork from [github.com/dgrr/http2](https://github.com/dgrr/http2)
 ## Download
 
 ```bash
-go get github.com/lafriks/http2@v0.3.5
+go get github.com/lafriks/http2@latest
 ```
 
 ## Help
@@ -96,7 +96,12 @@ See [examples/h2c](./examples/h2c/main.go) for a complete example.
 
 ## How to use the client?
 
-The HTTP/2 client only works with the HostClient.
+### Single host with HostClient
+
+[ConfigureClient](https://pkg.go.dev/github.com/lafriks/http2#ConfigureClient) eagerly dials
+the host, negotiates HTTP/2 via TLS ALPN, and installs an HTTP/2 transport on
+the `HostClient`. It returns `ErrServerSupport` when the server doesn't speak
+HTTP/2 (the `HostClient` is left unchanged and stays on HTTP/1.1).
 
 ```go
 package main
@@ -126,6 +131,31 @@ func main() {
         fmt.Printf("%d: %s\n", statusCode, body)
 }
 ```
+
+### Multi-host with fasthttp.Client
+
+`fasthttp.Client` can upgrade individual backends to HTTP/2 through its
+`ConfigureClient` hook. The hook is called once per backend host, under the
+client's internal host-map lock:
+
+```go
+c := &fasthttp.Client{
+    ConfigureClient: func(hc *fasthttp.HostClient) error {
+        err := http2.ConfigureClient(hc, http2.ClientOpts{})
+        if errors.Is(err, http2.ErrServerSupport) {
+            return nil // host doesn't speak HTTP/2; keep HTTP/1.1
+        }
+        return err
+    },
+}
+```
+
+> **Locking caveat:** `ConfigureClient` dials the host eagerly inside the hook,
+> which runs under the client's internal host-map lock. A slow or unreachable
+> host will delay the first request to *every* other host for the duration of
+> the TCP/TLS handshake. This is fine for a fixed set of known backends; for
+> latency-sensitive clients talking to arbitrary or potentially unreachable
+> hosts, use per-host `HostClient`s instead.
 
 ## Benchmarks
 
