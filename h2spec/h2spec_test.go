@@ -147,13 +147,8 @@ func TestH2Spec(t *testing.T) {
 		{desc: "http2/6.10/1"},
 		{desc: "http2/6.10/2"},
 		{desc: "http2/6.10/3"},
-		// About(dario): In this one the client sends a HEADERS with END_HEADERS
-		//               and then sending a CONTINUATION frame.
-		//               The thing is that we process the request just after reading
-		//               the END_HEADERS, so we don't know about the next continuation.
-		//
-		// {desc: "http2/6.10/4"},
-		// {desc: "http2/6.10/5"},
+		{desc: "http2/6.10/4"},
+		{desc: "http2/6.10/5"},
 		{desc: "http2/6.10/6"},
 		{desc: "http2/7/1"},
 		{desc: "http2/7/2"},

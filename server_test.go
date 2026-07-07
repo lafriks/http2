@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -1635,5 +1636,361 @@ func TestIdleConnection(t *testing.T) {
 	_, err = c.readNext()
 	if err == nil {
 		t.Fatal("Expecting error")
+	}
+}
+
+// writeDataFrame sends a DATA frame with explicit END_STREAM control, for
+// requests whose stream is ended by a trailer HEADERS frame instead.
+func writeDataFrame(c *Conn, id uint32, endStream bool, body []byte) error {
+	fr := AcquireFrameHeader()
+	fr.SetStream(id)
+
+	data := AcquireFrame(FrameData).(*Data)
+	data.SetEndStream(endStream)
+	data.SetPadding(false)
+	data.SetData(body)
+
+	fr.SetBody(data)
+
+	return c.writeFrame(fr)
+}
+
+// readNextOn returns the next frame on the given stream, skipping the
+// WINDOW_UPDATE frames that replenish the upload windows.
+func readNextOn(t *testing.T, c *Conn, id uint32) *FrameHeader {
+	t.Helper()
+
+	for {
+		fr, err := c.readNext()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if fr.Type() == FrameWindowUpdate {
+			ReleaseFrameHeader(fr)
+			continue
+		}
+
+		if fr.Stream() != id {
+			t.Fatalf("expected frame on stream %d, got %s on %d", id, fr.Type(), fr.Stream())
+		}
+
+		return fr
+	}
+}
+
+// decodeHeaderBlock decodes the header block of a received HEADERS frame.
+func decodeHeaderBlock(t *testing.T, c *Conn, fr *FrameHeader) map[string]string {
+	t.Helper()
+
+	hs := make(map[string]string)
+
+	hf := AcquireHeaderField()
+	defer ReleaseHeaderField(hf)
+
+	b := fr.Body().(FrameWithHeaders).Headers()
+	for len(b) > 0 {
+		var err error
+		b, err = c.dec.Next(hf, b)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		hs[hf.Key()] = hf.Value()
+	}
+
+	return hs
+}
+
+func TestRequestTrailers(t *testing.T) {
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				fmt.Fprintf(ctx, "body=%s;x-checksum=%s;trailers=",
+					ctx.Request.Body(), ctx.Request.Header.Peek("x-checksum"))
+				for _, k := range ctx.Request.Header.PeekTrailerKeys() {
+					fmt.Fprintf(ctx, "[%s]", k)
+				}
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	// neither the request headers nor the body end the stream: the trailer
+	// HEADERS frame does (RFC 9113, section 8.1)
+	c.writeFrame(makeHeadersOrdered(3, c.enc, true, false, [][2]string{
+		{":method", "POST"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+		{"content-length", "5"},
+	}))
+
+	if err := writeDataFrame(c, 3, false, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+
+	c.writeFrame(makeHeadersOrdered(3, c.enc, true, true, [][2]string{
+		{"x-checksum", "abc"},
+	}))
+
+	var body []byte
+	for {
+		fr := readNextOn(t, c, 3)
+
+		switch fr.Type() {
+		case FrameHeaders:
+		case FrameData:
+			body = append(body, fr.Body().(*Data).Data()...)
+		default:
+			t.Fatalf("unexpected frame %s", fr.Type())
+		}
+
+		done := fr.Flags().Has(FlagEndStream)
+		ReleaseFrameHeader(fr)
+
+		if done {
+			break
+		}
+	}
+
+	// the trailer value must be readable like a header, and the trailer
+	// keys must be listed so handlers can tell them apart
+	want := "body=hello;x-checksum=abc;trailers=[X-Checksum]"
+	if string(body) != want {
+		t.Fatalf("handler saw %q, want %q", body, want)
+	}
+}
+
+func TestMalformedRequestTrailersAreReset(t *testing.T) {
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				ctx.WriteString("OK")
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name      string
+		endStream bool
+		trailers  [][2]string
+	}{
+		// trailers must end the stream (RFC 9113, section 8.1)
+		{"missing END_STREAM", false, [][2]string{{"x-checksum", "abc"}}},
+		{"pseudo-header field", true, [][2]string{{":method", "GET"}}},
+		// forbidden in a trailer section (RFC 9110, section 6.5.1)
+		{"forbidden field", true, [][2]string{{"content-length", "5"}}},
+		{"uppercase field name", true, [][2]string{{"X-Checksum", "abc"}}},
+	}
+
+	id := uint32(3)
+
+	for _, tc := range cases {
+		c.writeFrame(makeHeadersOrdered(id, c.enc, true, false, [][2]string{
+			{":method", "POST"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+		}))
+
+		if err := writeDataFrame(c, id, false, []byte("hello")); err != nil {
+			t.Fatal(err)
+		}
+
+		c.writeFrame(makeHeadersOrdered(id, c.enc, true, tc.endStream, tc.trailers))
+
+		fr := readNextOn(t, c, id)
+
+		if fr.Type() != FrameResetStream {
+			t.Fatalf("%s: expected reset of stream %d, got %s", tc.name, id, fr.Type())
+		}
+
+		if code := fr.Body().(*RstStream).Code(); code != ProtocolError {
+			t.Fatalf("%s: expected ProtocolError, got %s", tc.name, code)
+		}
+
+		ReleaseFrameHeader(fr)
+
+		id += 2
+	}
+
+	// a content-length not matching the DATA payloads is only detectable
+	// once the trailers end the body (RFC 9113, section 8.1.1)
+	c.writeFrame(makeHeadersOrdered(id, c.enc, true, false, [][2]string{
+		{":method", "POST"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+		{"content-length", "5"},
+	}))
+
+	if err := writeDataFrame(c, id, false, []byte("xx")); err != nil {
+		t.Fatal(err)
+	}
+
+	c.writeFrame(makeHeadersOrdered(id, c.enc, true, true, [][2]string{
+		{"x-checksum", "abc"},
+	}))
+
+	fr := readNextOn(t, c, id)
+
+	if fr.Type() != FrameResetStream || fr.Body().(*RstStream).Code() != ProtocolError {
+		t.Fatalf("content-length mismatch: expected ProtocolError reset, got %s", fr.Type())
+	}
+
+	ReleaseFrameHeader(fr)
+
+	id += 2
+
+	// the connection and its HPACK state must survive: a valid request
+	// with trailers still gets served
+	c.writeFrame(makeHeadersOrdered(id, c.enc, true, false, [][2]string{
+		{":method", "POST"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+	}))
+
+	if err := writeDataFrame(c, id, false, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+
+	c.writeFrame(makeHeadersOrdered(id, c.enc, true, true, [][2]string{
+		{"x-checksum", "abc"},
+	}))
+
+	for _, expect := range []FrameType{FrameHeaders, FrameData} {
+		fr := readNextOn(t, c, id)
+
+		if fr.Type() != expect {
+			t.Fatalf("expected %s on stream %d, got %s", expect, id, fr.Type())
+		}
+
+		ReleaseFrameHeader(fr)
+	}
+}
+
+func TestResponseTrailers(t *testing.T) {
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				if err := ctx.Response.Header.AddTrailer("grpc-status, grpc-message"); err != nil {
+					ctx.Error(err.Error(), fasthttp.StatusInternalServerError)
+					return
+				}
+
+				ctx.Response.Header.Set("grpc-status", "0")
+				ctx.Response.Header.Set("grpc-message", "all good")
+
+				if string(ctx.Path()) == "/stream" {
+					ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
+						w.WriteString("hello stream")
+					})
+				} else {
+					ctx.WriteString("hello")
+				}
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	id := uint32(3)
+
+	for _, tc := range []struct {
+		path string
+		body string
+	}{
+		{"/", "hello"},
+		{"/stream", "hello stream"},
+	} {
+		c.writeFrame(makeHeadersOrdered(id, c.enc, true, true, [][2]string{
+			{":method", "GET"}, {":path", tc.path}, {":scheme", "https"}, {":authority", "localhost"},
+		}))
+
+		// the response headers must announce the trailers without carrying
+		// their values, and must not end the stream
+		fr := readNextOn(t, c, id)
+
+		if fr.Type() != FrameHeaders {
+			t.Fatalf("%s: expected HEADERS, got %s", tc.path, fr.Type())
+		}
+
+		if fr.Flags().Has(FlagEndStream) {
+			t.Fatalf("%s: response headers ended the stream before the trailers", tc.path)
+		}
+
+		hs := decodeHeaderBlock(t, c, fr)
+		ReleaseFrameHeader(fr)
+
+		if _, ok := hs["trailer"]; !ok {
+			t.Fatalf("%s: missing trailer announcement: %v", tc.path, hs)
+		}
+
+		if _, ok := hs["grpc-status"]; ok {
+			t.Fatalf("%s: trailer field sent with the response headers", tc.path)
+		}
+
+		// DATA frames must leave the stream open for the trailers
+		var body []byte
+
+		fr = readNextOn(t, c, id)
+		for fr.Type() == FrameData {
+			if fr.Flags().Has(FlagEndStream) {
+				t.Fatalf("%s: DATA ended the stream before the trailers", tc.path)
+			}
+
+			body = append(body, fr.Body().(*Data).Data()...)
+			ReleaseFrameHeader(fr)
+
+			fr = readNextOn(t, c, id)
+		}
+
+		if string(body) != tc.body {
+			t.Fatalf("%s: got body %q, want %q", tc.path, body, tc.body)
+		}
+
+		// the trailer HEADERS frame carries the fields and ends the stream
+		if fr.Type() != FrameHeaders || !fr.Flags().Has(FlagEndStream) {
+			t.Fatalf("%s: expected trailer HEADERS with END_STREAM, got %s (flags %x)",
+				tc.path, fr.Type(), fr.Flags())
+		}
+
+		hs = decodeHeaderBlock(t, c, fr)
+		ReleaseFrameHeader(fr)
+
+		if hs["grpc-status"] != "0" || hs["grpc-message"] != "all good" {
+			t.Fatalf("%s: wrong trailer fields: %v", tc.path, hs)
+		}
+
+		id += 2
 	}
 }

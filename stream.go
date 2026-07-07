@@ -46,9 +46,19 @@ type Stream struct {
 	headerBlockNum int
 
 	// original type
-	origType        FrameType
-	startedAt       time.Time
+	origType  FrameType
+	startedAt time.Time
+	// headersFinished reports that no header block is currently open: the
+	// last HEADERS frame (initial or trailer) received its END_HEADERS
 	headersFinished bool
+	// trailers marks that a trailer section started: the fields of the
+	// current header block belong to the trailers (RFC 9113, section 8.1)
+	trailers bool
+	// endStreamPending remembers an END_STREAM flag seen on a HEADERS
+	// frame: it only takes effect once the header block is complete, so
+	// that requests ending in CONTINUATION or trailer frames aren't
+	// dispatched before all their fields are decoded
+	endStreamPending bool
 
 	// header validation state (RFC 9113, sections 8.1 to 8.3)
 	pseudoSeen         uint8
@@ -99,6 +109,8 @@ func NewStream(id uint32, win int32) *Stream {
 	strm.window = int64(win)
 	strm.state = StreamStateIdle
 	strm.headersFinished = false
+	strm.trailers = false
+	strm.endStreamPending = false
 	strm.startedAt = time.Time{}
 	strm.previousHeaderBytes = strm.previousHeaderBytes[:0]
 	strm.ctx = nil

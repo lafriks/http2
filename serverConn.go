@@ -330,6 +330,16 @@ func (sc *serverConn) readLoop() (err error) {
 				break
 			}
 
+			// a CONTINUATION frame is only valid while a header block is
+			// open on that same stream (RFC 9113, section 6.10); without
+			// this check the fragment would bypass the HPACK decoder and
+			// desynchronize the tables
+			if fr.Type() == FrameContinuation && headerBlockStream != fr.Stream() {
+				ReleaseFrameHeader(fr)
+				err = NewGoAwayError(ProtocolError, "CONTINUATION without a preceding HEADERS")
+				break
+			}
+
 			// track header-block continuity for the unknown-frame check
 			if t := fr.Type(); t == FrameHeaders || t == FrameContinuation {
 				if fr.Flags().Has(FlagEndHeaders) {
@@ -874,32 +884,40 @@ func (sc *serverConn) writeError(strm *Stream, err error) {
 func handleState(fr *FrameHeader, strm *Stream) {
 	if fr.Type() == FrameResetStream {
 		strm.SetState(StreamStateClosed)
+		return
 	}
 
 	switch strm.State() {
 	case StreamStateIdle:
 		if fr.Type() == FrameHeaders {
 			strm.SetState(StreamStateOpen)
-			if fr.Flags().Has(FlagEndStream) {
+			if endStreamReceived(fr, strm) {
 				strm.SetState(StreamStateHalfClosed)
 			}
 		} // TODO: else push promise ...
 	case StreamStateReserved:
 		// TODO: ...
 	case StreamStateOpen:
-		if fr.Flags().Has(FlagEndStream) {
+		if endStreamReceived(fr, strm) {
 			strm.SetState(StreamStateHalfClosed)
-		} else if fr.Type() == FrameResetStream {
-			strm.SetState(StreamStateClosed)
 		}
 	case StreamStateHalfClosed:
 		// a stream can only go from HalfClosed to Closed if the client
 		// sends a ResetStream frame.
-		if fr.Type() == FrameResetStream {
-			strm.SetState(StreamStateClosed)
-		}
 	case StreamStateClosed:
 	}
+}
+
+// endStreamReceived reports whether the client half-closed the stream with
+// this frame. An END_STREAM flag on a HEADERS frame only takes effect once
+// its header (or trailer) block is complete: the request must not be
+// dispatched while CONTINUATION or trailer fields are still to be decoded.
+func endStreamReceived(fr *FrameHeader, strm *Stream) bool {
+	if fr.Type() == FrameHeaders || fr.Type() == FrameContinuation {
+		return strm.headersFinished && strm.endStreamPending
+	}
+
+	return fr.Flags().Has(FlagEndStream)
 }
 
 var logger = log.New(os.Stdout, "[HTTP/2] ", log.LstdFlags)
@@ -946,13 +964,35 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 				return NewGoAwayError(ProtocolError, "END_HEADERS received on an incomplete stream")
 			}
 
+			if strm.trailers {
+				// the trailer section ended; an over-limit header list
+				// skips the checks the same way the request headers do
+				if !strm.tooLargeHeaders {
+					if strm.headerViolation != "" {
+						return NewResetStreamError(ProtocolError, strm.headerViolation)
+					}
+
+					// the body ended with the trailers: a content-length
+					// not matching the DATA payloads is malformed
+					// (RFC 9113, section 8.1.1)
+					if !strm.tooLargeBody &&
+						strm.expectedContentLength >= 0 &&
+						strm.expectedContentLength != int64(len(strm.ctx.Request.Body())) {
+
+						return NewResetStreamError(ProtocolError, "content-length header field does not match the DATA payload")
+					}
+				}
+
+				return nil
+			}
+
 			// calling req.URI() triggers a URL parsing, so because of that we need to delay the URL parsing.
 			strm.ctx.Request.URI().SetSchemeBytes(strm.scheme)
 
 			// an over-limit header list skips the validation: fields were
 			// discarded and the request is answered with 431 regardless
 			if !strm.tooLargeHeaders {
-				if err := validateRequestHeaders(strm, fr); err != nil {
+				if err := validateRequestHeaders(strm); err != nil {
 					return err
 				}
 
@@ -1031,9 +1071,24 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 }
 
 func (sc *serverConn) handleHeaderFrame(strm *Stream, fr *FrameHeader) error {
-	if strm.headersFinished && !fr.Flags().Has(FlagEndStream|FlagEndHeaders) {
-		// TODO handle trailers
-		return NewGoAwayError(ProtocolError, "stream not open")
+	if fr.Type() == FrameHeaders && strm.headersFinished {
+		// a HEADERS frame after the request headers starts the trailer
+		// section (RFC 9113, section 8.1), which reopens the header block
+		strm.trailers = true
+		strm.headersFinished = false
+
+		// trailers must carry END_STREAM: without it the request is
+		// malformed, but the block is still decoded so the HPACK tables
+		// stay synchronized; the stream is reset once the block ends
+		if !fr.Flags().Has(FlagEndStream) {
+			strm.recordViolation("trailer HEADERS frame without END_STREAM")
+		}
+	}
+
+	// END_STREAM only takes effect once the header block completes: the
+	// stream state changes on the frame carrying END_HEADERS
+	if fr.Type() == FrameHeaders && fr.Flags().Has(FlagEndStream) {
+		strm.endStreamPending = true
 	}
 
 	if headerFrame, ok := fr.Body().(*Headers); ok && headerFrame.Stream() == strm.ID() {
@@ -1090,6 +1145,20 @@ func (sc *serverConn) handleHeaderFrame(strm *Stream, fr *FrameHeader) error {
 		}
 
 		k, v := hf.KeyBytes(), hf.ValueBytes()
+
+		if strm.trailers {
+			// trailer fields have their own rules (RFC 9113, section 8.1):
+			// pseudo-header fields are forbidden, and so are the fields
+			// listed in RFC 9110, section 6.5.1
+			if hf.IsPseudo() {
+				strm.recordViolation("pseudo-header field in trailer section")
+				continue
+			}
+
+			validateTrailerField(strm, req, k, v)
+
+			continue
+		}
 
 		if hf.IsPseudo() {
 			if err = parsePseudoField(strm, req, k[1:], v); err != nil {
@@ -1233,13 +1302,35 @@ func validateRegularField(strm *Stream, k, v []byte) {
 	}
 }
 
+// validateTrailerField checks and stores a request trailer field. The value
+// lands in the header storage — like fasthttp does for HTTP/1.1 trailers —
+// and the key is registered as a trailer, so handlers can tell trailers and
+// headers apart through Request.Header.Trailers().
+func validateTrailerField(strm *Stream, req *fasthttp.Request, k, v []byte) {
+	for _, c := range k {
+		if 'A' <= c && c <= 'Z' {
+			strm.recordViolation("uppercase header field name")
+			return
+		}
+	}
+
+	// AddTrailerBytes rejects the fields that RFC 9110 (section 6.5.1)
+	// forbids in a trailer section (framing, routing, authentication...)
+	if err := req.Header.AddTrailerBytes(k); err != nil {
+		strm.recordViolation("field not allowed in trailer section")
+		return
+	}
+
+	req.Header.AddBytesKV(k, v)
+}
+
 // validateRequestHeaders enforces the rules that can only be checked once
 // the header block ends: mandatory pseudo-header fields (RFC 9113, section
 // 8.3.1) and a content-length coherent with END_STREAM (section 8.1.1).
 // Violations recorded while decoding are surfaced here as well, now that
 // the HPACK state is synchronized: the malformed request resets the stream
 // instead of killing the connection.
-func validateRequestHeaders(strm *Stream, fr *FrameHeader) error {
+func validateRequestHeaders(strm *Stream) error {
 	if strm.headerViolation == "" {
 		switch {
 		case strm.pseudoSeen&pseudoMethod == 0:
@@ -1257,7 +1348,7 @@ func validateRequestHeaders(strm *Stream, fr *FrameHeader) error {
 			strm.recordViolation("missing :path pseudo-header field")
 		}
 
-		if fr.Flags().Has(FlagEndStream) && strm.expectedContentLength > 0 {
+		if strm.endStreamPending && strm.expectedContentLength > 0 {
 			strm.recordViolation("content-length header field on a request without payload")
 		}
 	}
@@ -1310,13 +1401,16 @@ func (sc *serverConn) handleEndRequest(strm *Stream) {
 	}
 
 	hasBody := ctx.Response.IsBodyStream() || len(ctx.Response.Body()) > 0
+	// fields announced with Response.Header.SetTrailer/AddTrailer are sent
+	// in a HEADERS frame after the body, and that frame ends the stream
+	hasTrailer := len(ctx.Response.Header.PeekTrailerKeys()) > 0
 
 	fr := AcquireFrameHeader()
 	fr.SetStream(strm.ID())
 
 	h := AcquireFrame(FrameHeaders).(*Headers)
 	h.SetEndHeaders(true)
-	h.SetEndStream(!hasBody)
+	h.SetEndStream(!hasBody && !hasTrailer)
 
 	fr.SetBody(h)
 
@@ -1330,12 +1424,42 @@ func (sc *serverConn) handleEndRequest(strm *Stream) {
 			streamWriter.strm = strm
 			streamWriter.writer = sc.writer
 			streamWriter.size = int64(ctx.Response.Header.ContentLength())
+			streamWriter.trailer = hasTrailer
 			_ = ctx.Response.BodyWriteTo(streamWriter)
 			releaseStreamWrite(streamWriter)
 		} else {
-			sc.writeData(strm, ctx.Response.Body())
+			sc.writeData(strm, ctx.Response.Body(), !hasTrailer)
 		}
 	}
+
+	if hasTrailer {
+		sc.writeTrailer(strm, &ctx.Response)
+	}
+}
+
+// writeTrailer encodes the response fields announced as trailers into the
+// HEADERS frame that ends the stream (RFC 9113, section 8.1). The values
+// are the ones set on the response header under the announced keys.
+func (sc *serverConn) writeTrailer(strm *Stream, res *fasthttp.Response) {
+	fr := AcquireFrameHeader()
+	fr.SetStream(strm.ID())
+
+	h := AcquireFrame(FrameHeaders).(*Headers)
+	h.SetEndHeaders(true)
+	h.SetEndStream(true)
+
+	fr.SetBody(h)
+
+	hf := AcquireHeaderField()
+	defer ReleaseHeaderField(hf)
+
+	for _, k := range res.Header.PeekTrailerKeys() {
+		hf.SetBytes(k, res.Header.PeekBytes(k))
+		ToLower(hf.KeyBytes())
+		h.AppendHeaderField(&sc.enc, hf, false)
+	}
+
+	sc.writeFrame(fr)
 }
 
 var (
@@ -1356,6 +1480,9 @@ type streamWrite struct {
 	written int64
 	strm    *Stream
 	writer  chan<- *FrameHeader
+	// trailer suppresses END_STREAM on the last DATA frame: a trailer
+	// HEADERS frame ends the stream instead
+	trailer bool
 }
 
 func acquireStreamWrite() *streamWrite {
@@ -1376,6 +1503,7 @@ func (s *streamWrite) Reset() {
 	s.written = 0
 	s.strm = nil
 	s.writer = nil
+	s.trailer = false
 }
 
 func (s *streamWrite) Write(body []byte) (n int, err error) {
@@ -1398,7 +1526,7 @@ func (s *streamWrite) Write(body []byte) (n int, err error) {
 		fr.SetStream(s.strm.ID())
 
 		data := AcquireFrame(FrameData).(*Data)
-		data.SetEndStream(end && i+step == n)
+		data.SetEndStream(end && i+step == n && !s.trailer)
 		data.SetPadding(false)
 		data.SetData(body[i : step+i])
 
@@ -1435,12 +1563,14 @@ func (s *streamWrite) ReadFrom(r io.Reader) (num int64, err error) {
 		// has been reached.
 		end := eof || (s.size >= 0 && num >= s.size)
 
-		if n > 0 || end {
+		// with trailers pending there's no point in an empty DATA frame:
+		// the trailer HEADERS frame ends the stream
+		if n > 0 || (end && !s.trailer) {
 			fr := AcquireFrameHeader()
 			fr.SetStream(s.strm.ID())
 
 			data := AcquireFrame(FrameData).(*Data)
-			data.SetEndStream(end)
+			data.SetEndStream(end && !s.trailer)
 			data.SetPadding(false)
 			data.SetData(buf[:n])
 			fr.SetBody(data)
@@ -1467,7 +1597,7 @@ func (s *streamWrite) ReadFrom(r io.Reader) (num int64, err error) {
 	return num, err
 }
 
-func (sc *serverConn) writeData(strm *Stream, body []byte) {
+func (sc *serverConn) writeData(strm *Stream, body []byte, endStream bool) {
 	step := 1 << 14 // max frame size 16384
 	if strm.window > 0 && step > int(strm.window) {
 		step = int(strm.window)
@@ -1482,7 +1612,7 @@ func (sc *serverConn) writeData(strm *Stream, body []byte) {
 		fr.SetStream(strm.ID())
 
 		data := AcquireFrame(FrameData).(*Data)
-		data.SetEndStream(i+step == len(body))
+		data.SetEndStream(endStream && i+step == len(body))
 		data.SetPadding(false)
 		data.SetData(body[i : step+i])
 
@@ -1564,11 +1694,30 @@ func fasthttpResponseHeaders(dst *Headers, hp *HPACK, res *fasthttp.Response) {
 	// Remove the Transfer-Encoding field
 	res.Header.Del("Transfer-Encoding")
 
+	trailer := res.Header.PeekTrailerKeys()
+
 	for k, v := range res.Header.All() {
+		// fields announced as trailers travel in the HEADERS frame that
+		// ends the stream, not with the response headers (the "trailer"
+		// announcement itself is yielded by All and does get written)
+		if isTrailerField(trailer, k) {
+			continue
+		}
+
 		hf.SetBytes(k, v)
 		ToLower(hf.KeyBytes())
 		dst.AppendHeaderField(hp, hf, false)
 	}
+}
+
+func isTrailerField(trailer [][]byte, k []byte) bool {
+	for _, t := range trailer {
+		if bytes.Equal(t, k) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func limitedReaderSize(r io.Reader) int64 {
