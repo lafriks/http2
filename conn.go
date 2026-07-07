@@ -114,8 +114,15 @@ type Conn struct {
 
 	current Settings
 	serverS Settings
+	// serverMaxStreams mirrors serverS.maxStreams for CanOpenStream, which
+	// runs on caller goroutines while the readLoop rewrites serverS
+	serverMaxStreams atomic.Uint32
+	// encTableSize carries a pending HPACK table size from the server's
+	// SETTINGS (read on the readLoop) to the writeLoop that owns the
+	// encoder; negative means nothing pending
+	encTableSize atomic.Int64
 
-	state    connState
+	state    atomic.Int32
 	closeRef uint32
 
 	reqQueued sync.Map
@@ -130,10 +137,11 @@ type Conn struct {
 	unacks      atomic.Int32
 	disableAcks bool
 
-	lastErr      error
+	// lastErr is written by both loops and read through LastErr
+	lastErr      atomic.Pointer[error]
 	onDisconnect func(*Conn)
 
-	closed uint64
+	closed atomic.Bool
 }
 
 // NewConn returns a new HTTP/2 connection.
@@ -159,6 +167,7 @@ func NewConn(c net.Conn, opts ConnOpts) *Conn {
 	}
 
 	nc.sendCond.L = &nc.sendMu
+	nc.encTableSize.Store(-1)
 
 	nc.current.SetMaxWindowSize(1 << 20)
 	nc.current.SetPush(false)
@@ -255,7 +264,15 @@ func (c *Conn) SetOnDisconnect(cb func(*Conn)) {
 
 // LastErr returns the last registered error in case the connection was closed by the server.
 func (c *Conn) LastErr() error {
-	return c.lastErr
+	if p := c.lastErr.Load(); p != nil {
+		return *p
+	}
+
+	return nil
+}
+
+func (c *Conn) setLastErr(err error) {
+	c.lastErr.Store(&err)
 }
 
 // Handshake will perform the necessary handshake to establish the connection
@@ -287,6 +304,7 @@ func (c *Conn) doHandshake() error {
 		st := fr.Body().(*Settings)
 		if !st.IsAck() {
 			st.CopyTo(&c.serverS)
+			c.serverMaxStreams.Store(c.serverS.maxStreams)
 
 			c.sendMu.Lock()
 			c.serverInitialWindow = int64(c.serverS.MaxWindowSize())
@@ -322,11 +340,11 @@ func (c *Conn) doHandshake() error {
 }
 
 func (c *Conn) getState() connState {
-	return connState(atomic.LoadInt32((*int32)(&c.state)))
+	return connState(c.state.Load())
 }
 
 func (c *Conn) setState(st connState) {
-	atomic.StoreInt32((*int32)(&c.state), int32(st))
+	c.state.Store(int32(st))
 }
 
 // CanOpenStream returns whether the client will be able to open a new stream or not.
@@ -334,18 +352,18 @@ func (c *Conn) setState(st connState) {
 // A connection draining after a server GOAWAY can't open new streams.
 func (c *Conn) CanOpenStream() bool {
 	return c.getState() == connStateOpen &&
-		c.openStreams.Load() < int32(c.serverS.maxStreams)
+		c.openStreams.Load() < int32(c.serverMaxStreams.Load())
 }
 
 // Closed indicates whether the connection is closed or not.
 func (c *Conn) Closed() bool {
-	return atomic.LoadUint64(&c.closed) == 1
+	return c.closed.Load()
 }
 
 // Close closes the connection gracefully, sending a GoAway message
 // and then closing the underlying TCP connection.
 func (c *Conn) Close() error {
-	if !atomic.CompareAndSwapUint64(&c.closed, 0, 1) {
+	if !c.closed.CompareAndSwap(false, true) {
 		return io.EOF
 	}
 
@@ -395,7 +413,7 @@ var ErrStreamNotReady = errors.New("stream hasn't been created")
 //
 // Cancel can only return ErrStreamNotReady when the cancel is performed before the stream is created.
 func (c *Conn) Cancel(ctx *Ctx) error {
-	if atomic.LoadUint32(&ctx.streamID) == 0 {
+	if ctx.streamID.Load() == 0 {
 		return ErrStreamNotReady
 	}
 
@@ -405,7 +423,7 @@ func (c *Conn) Cancel(ctx *Ctx) error {
 }
 
 func (c *Conn) cancel(ctx *Ctx) {
-	id := atomic.LoadUint32(&ctx.streamID)
+	id := ctx.streamID.Load()
 
 	h := AcquireFrameHeader()
 	h.SetStream(id)
@@ -584,7 +602,7 @@ func (c *Conn) readLoop() {
 	for {
 		fr, err := c.readNext()
 		if err != nil {
-			c.lastErr = err
+			c.setLastErr(err)
 			break
 		}
 
@@ -644,6 +662,12 @@ func (c *Conn) writeRequest(ctx *Ctx) error {
 
 	enc := c.enc
 
+	// apply an HPACK table size a SETTINGS frame changed meanwhile; the
+	// writeLoop owns the encoder
+	if v := c.encTableSize.Swap(-1); v >= 0 {
+		enc.SetMaxTableSize(uint32(v))
+	}
+
 	id := c.nextID
 	c.nextID += 2
 
@@ -694,7 +718,7 @@ func (c *Conn) writeRequest(ctx *Ctx) error {
 	h.SetEndHeaders(true)
 
 	// store the ctx before sending the request
-	atomic.StoreUint32(&ctx.streamID, id)
+	ctx.streamID.Store(id)
 	c.reqQueued.Store(id, ctx)
 
 	_, err := fr.WriteTo(c.bw)
@@ -729,7 +753,7 @@ func (c *Conn) writeRequest(ctx *Ctx) error {
 	}
 
 	if err != nil {
-		c.lastErr = err
+		c.setLastErr(err)
 		// if we had any error, remove it from the reqQueued.
 		c.reqQueued.Delete(id)
 	}
@@ -1072,6 +1096,7 @@ func (c *Conn) writePing() error {
 
 func (c *Conn) handleSettings(st *Settings) {
 	st.CopyTo(&c.serverS)
+	c.serverMaxStreams.Store(c.serverS.maxStreams)
 
 	// a changed INITIAL_WINDOW_SIZE applies to every stream, the open
 	// ones retroactively (RFC 9113, section 6.9.2): the send windows
@@ -1081,7 +1106,9 @@ func (c *Conn) handleSettings(st *Settings) {
 	c.sendCond.Broadcast()
 	c.sendMu.Unlock()
 
-	c.enc.SetMaxTableSize(st.HeaderTableSize())
+	// the HPACK encoder belongs to the writeLoop: park the new table
+	// size for it instead of racing the request encoding
+	c.encTableSize.Store(int64(st.HeaderTableSize()))
 
 	// reply back
 	fr := AcquireFrameHeader()

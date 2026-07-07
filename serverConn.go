@@ -49,10 +49,14 @@ type serverConn struct {
 	// INITIAL_WINDOW_SIZE never changes the connection window), grows
 	// with the peer's WINDOW_UPDATEs and shrinks with the DATA sent.
 	// int64 because the user can try to overflow it.
-	clientWindow int64
+	clientWindow atomic.Int64
 	// clientInitialWindow is the peer's SETTINGS_INITIAL_WINDOW_SIZE:
 	// the base of every stream's send window (see Stream.window)
-	clientInitialWindow int64
+	clientInitialWindow atomic.Int64
+	// encTableSize carries a pending HPACK table size from the peer's
+	// SETTINGS (read on the readLoop) to the goroutine that owns the
+	// encoder; negative means nothing pending
+	encTableSize atomic.Int64
 	// windowPoke wakes handleStreams when the connection window or the
 	// peer's INITIAL_WINDOW_SIZE moved, so stalled responses get retried
 	windowPoke chan struct{}
@@ -64,11 +68,11 @@ type serverConn struct {
 	writer chan *FrameHeader
 	reader chan *FrameHeader
 
-	state connState
+	state atomic.Int32
 	// closeRef stores the last stream that was valid before sending a GOAWAY.
 	// Thus, the number stored in closeRef is used to complete all the requests that were sent before
 	// to gracefully close the connection with a GOAWAY.
-	closeRef uint32
+	closeRef atomic.Uint32
 
 	// maxRequestTime is the max time of a request over one single stream
 	maxRequestTime time.Duration
@@ -135,6 +139,14 @@ type serverConn struct {
 	logger fasthttp.Logger
 }
 
+func (sc *serverConn) getState() connState {
+	return connState(sc.state.Load())
+}
+
+func (sc *serverConn) setState(st connState) {
+	sc.state.Store(int32(st))
+}
+
 // gracefulShutdown signals the connection to send a GOAWAY, serve the
 // streams accepted so far and then close. It's safe to call it multiple
 // times and from any goroutine.
@@ -159,8 +171,9 @@ func (sc *serverConn) Handshake() error {
 func (sc *serverConn) Serve() error {
 	sc.closer = make(chan struct{}, 1)
 	sc.maxRequestTimer = time.NewTimer(0)
-	sc.clientWindow = 65535
-	sc.clientInitialWindow = 65535
+	sc.clientWindow.Store(65535)
+	sc.clientInitialWindow.Store(65535)
+	sc.encTableSize.Store(-1)
 	sc.windowPoke = make(chan struct{}, 1)
 	sc.handlerDone = make(chan *Stream, sc.st.maxStreams)
 
@@ -394,7 +407,7 @@ func (sc *serverConn) readLoop() (err error) {
 			win := int64(fr.Body().(*WindowUpdate).Increment())
 			if win == 0 {
 				err = NewGoAwayError(ProtocolError, "window increment of 0")
-			} else if atomic.AddInt64(&sc.clientWindow, win) >= 1<<31-1 {
+			} else if sc.clientWindow.Add(win) >= 1<<31-1 {
 				err = NewGoAwayError(FlowControlError, "window is above limits")
 			} else {
 				// the connection window grew: retry stalled responses
@@ -580,7 +593,7 @@ func (sc *serverConn) handleStreams() {
 	finalShutdown := func() {
 		// an error GOAWAY might have been sent in the meantime; don't
 		// override its code, and don't raise the advertised last stream ID
-		if atomic.LoadInt32((*int32)(&sc.state)) != int32(connStateClosed) {
+		if sc.getState() != connStateClosed {
 			sc.writeGoAway(sc.lastID, NoError, "graceful shutdown")
 		}
 
@@ -597,7 +610,7 @@ func (sc *serverConn) handleStreams() {
 	// (a closing GOAWAY has been sent) once every stream accepted before
 	// the GOAWAY has been served.
 	maybeCloseAfterShutdown := func() {
-		ref := atomic.LoadUint32(&sc.closeRef)
+		ref := sc.closeRef.Load()
 		if ref == 0 {
 			return
 		}
@@ -648,7 +661,7 @@ loop:
 
 			finishResponse(strm)
 
-			if atomic.LoadInt32((*int32)(&sc.state)) == int32(connStateClosed) {
+			if sc.getState() == connStateClosed {
 				maybeCloseAfterShutdown()
 			}
 		case <-sc.windowPoke:
@@ -662,7 +675,7 @@ loop:
 				}
 			}
 
-			if atomic.LoadInt32((*int32)(&sc.state)) == int32(connStateClosed) {
+			if sc.getState() == connStateClosed {
 				maybeCloseAfterShutdown()
 			}
 		case <-closerCh:
@@ -687,7 +700,7 @@ loop:
 			// follows after one round trip (the shutdown PING ack), or when
 			// the grace period expires for clients that don't ack
 			sc.writeGoAwayFrame(1<<31-1, NoError, "graceful shutdown started")
-			atomic.StoreInt32((*int32)(&sc.state), int32(connStateDraining))
+			sc.setState(connStateDraining)
 
 			sc.writeShutdownPing()
 
@@ -766,7 +779,7 @@ loop:
 				return
 			}
 
-			isClosing := atomic.LoadInt32((*int32)(&sc.state)) == int32(connStateClosed)
+			isClosing := sc.getState() == connStateClosed
 
 			var strm *Stream
 			if fr.Stream() <= sc.lastID {
@@ -1014,6 +1027,14 @@ func (sc *serverConn) applyDataFlowControl(fr *FrameHeader, streamAlive bool) {
 	}
 }
 
+// applyEncTableSize applies an HPACK table size a SETTINGS frame changed
+// meanwhile. Must run on the handleStreams goroutine, the encoder's owner.
+func (sc *serverConn) applyEncTableSize() {
+	if v := sc.encTableSize.Swap(-1); v >= 0 {
+		sc.enc.SetMaxTableSize(uint32(v))
+	}
+}
+
 // pokeWindows wakes handleStreams to retry the responses stalled on flow
 // control. Non-blocking: a pending poke already covers this one.
 func (sc *serverConn) pokeWindows() {
@@ -1028,7 +1049,7 @@ func (sc *serverConn) pokeWindows() {
 // can be negative after an INITIAL_WINDOW_SIZE decrease (RFC 9113,
 // section 6.9.2).
 func (sc *serverConn) streamSendWindow(strm *Stream) int64 {
-	return atomic.LoadInt64(&sc.clientInitialWindow) + atomic.LoadInt64(&strm.window)
+	return sc.clientInitialWindow.Load() + strm.window.Load()
 }
 
 // updateWindow sends a WINDOW_UPDATE to replenish the peer's send window
@@ -1072,10 +1093,10 @@ func (sc *serverConn) writeGoAway(strm uint32, code ErrorCode, message string) {
 	sc.writeGoAwayFrame(strm, code, message)
 
 	if strm != 0 {
-		atomic.StoreUint32(&sc.closeRef, sc.lastID)
+		sc.closeRef.Store(sc.lastID)
 	}
 
-	atomic.StoreInt32((*int32)(&sc.state), int32(connStateClosed))
+	sc.setState(connStateClosed)
 }
 
 func (sc *serverConn) writeError(strm *Stream, err error) {
@@ -1308,7 +1329,7 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 			return NewGoAwayError(ProtocolError, "window increment of 0")
 		}
 
-		if atomic.AddInt64(&strm.window, win)+atomic.LoadInt64(&sc.clientInitialWindow) >= 1<<31-1 {
+		if strm.window.Add(win)+sc.clientInitialWindow.Load() >= 1<<31-1 {
 			return NewResetStreamError(FlowControlError, "window is above limits")
 		}
 	default:
@@ -1705,6 +1726,8 @@ func (sc *serverConn) handleEndRequest(strm *Stream) {
 // headers, body and the announced trailers. It must run on the
 // handleStreams goroutine, which owns the HPACK encoder.
 func (sc *serverConn) writeResponse(strm *Stream) {
+	sc.applyEncTableSize()
+
 	ctx := strm.ctx
 
 	hasBody := ctx.Response.IsBodyStream() || len(ctx.Response.Body()) > 0
@@ -1765,7 +1788,7 @@ func (sc *serverConn) pumpSend(strm *Stream) bool {
 		if win := sc.streamSendWindow(strm); win < int64(step) {
 			step = int(win)
 		}
-		if win := atomic.LoadInt64(&sc.clientWindow); win < int64(step) {
+		if win := sc.clientWindow.Load(); win < int64(step) {
 			step = int(win)
 		}
 
@@ -1817,8 +1840,8 @@ func (sc *serverConn) pumpSend(strm *Stream) bool {
 			sc.sendDataFrame(strm.ID(), chunk, endStream)
 
 			n := int64(len(chunk))
-			atomic.AddInt64(&strm.window, -n)
-			atomic.AddInt64(&sc.clientWindow, -n)
+			strm.window.Add(-n)
+			sc.clientWindow.Add(-n)
 		}
 	}
 
@@ -1852,6 +1875,8 @@ func (sc *serverConn) sendDataFrame(strmID uint32, chunk []byte, endStream bool)
 // HEADERS frame that ends the stream (RFC 9113, section 8.1). The values
 // are the ones set on the response header under the announced keys.
 func (sc *serverConn) writeTrailer(strm *Stream, res *fasthttp.Response) {
+	sc.applyEncTableSize()
+
 	fr := AcquireFrameHeader()
 	fr.SetStream(strm.ID())
 
@@ -1937,12 +1962,15 @@ func (sc *serverConn) writeLoop() {
 
 func (sc *serverConn) handleSettings(st *Settings) {
 	st.CopyTo(&sc.clientS)
-	sc.enc.SetMaxTableSize(sc.clientS.HeaderTableSize())
+
+	// the HPACK encoder belongs to the handleStreams goroutine: park the
+	// new table size for it instead of racing the response encoding
+	sc.encTableSize.Store(int64(sc.clientS.HeaderTableSize()))
 
 	// a changed INITIAL_WINDOW_SIZE applies to every stream, the open
 	// ones retroactively (RFC 9113, section 6.9.2); the send windows
 	// derive from this base, so storing it is the whole adjustment
-	atomic.StoreInt64(&sc.clientInitialWindow, int64(sc.clientS.MaxWindowSize()))
+	sc.clientInitialWindow.Store(int64(sc.clientS.MaxWindowSize()))
 	sc.pokeWindows()
 
 	fr := AcquireFrameHeader()

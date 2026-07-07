@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/valyala/fasthttp"
@@ -49,7 +50,7 @@ type Ctx struct {
 	Response *fasthttp.Response
 	Err      chan error
 
-	streamID uint32
+	streamID atomic.Uint32
 
 	// sendWindow is the stream's send-window delta: the server's
 	// WINDOW_UPDATEs minus the DATA sent; the effective window adds the

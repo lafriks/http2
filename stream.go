@@ -3,6 +3,7 @@ package http2
 import (
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/valyala/fasthttp"
@@ -43,7 +44,7 @@ type Stream struct {
 	// at any moment — which is exactly the RFC 9113 (section 6.9.2)
 	// semantics for INITIAL_WINDOW_SIZE changes, retroactive ones and
 	// negative windows included.
-	window              int64
+	window              atomic.Int64
 	state               StreamState
 	ctx                 *fasthttp.RequestCtx
 	scheme              []byte
@@ -147,7 +148,7 @@ var streamPool = sync.Pool{
 func NewStream(id uint32, win int32) *Stream {
 	strm := streamPool.Get().(*Stream)
 	strm.id = id
-	strm.window = int64(win)
+	strm.window.Store(int64(win))
 	strm.state = StreamStateIdle
 	strm.headersFinished = false
 	strm.trailers = false
@@ -198,15 +199,15 @@ func (s *Stream) SetState(state StreamState) {
 }
 
 func (s *Stream) Window() int32 {
-	return int32(s.window)
+	return int32(s.window.Load())
 }
 
 func (s *Stream) SetWindow(win int32) {
-	s.window = int64(win)
+	s.window.Store(int64(win))
 }
 
 func (s *Stream) IncrWindow(win int32) {
-	s.window += int64(win)
+	s.window.Add(int64(win))
 }
 
 func (s *Stream) Ctx() *fasthttp.RequestCtx {
