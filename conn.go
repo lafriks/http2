@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1266,18 +1265,18 @@ func (c *Conn) readHeader(b []byte, res *fasthttp.Response) error {
 
 		if hf.IsPseudo() {
 			if hf.KeyBytes()[1] == 's' { // status
-				n, err := strconv.ParseInt(hf.Value(), 10, 64)
+				n, err := fasthttp.ParseUint(hf.ValueBytes())
 				if err != nil {
 					return err
 				}
 
-				res.SetStatusCode(int(n))
+				res.SetStatusCode(n)
 				continue
 			}
 		}
 
 		if bytes.Equal(hf.KeyBytes(), StringContentLength) {
-			n, _ := strconv.Atoi(hf.Value())
+			n, _ := fasthttp.ParseUint(hf.ValueBytes())
 			res.Header.SetContentLength(n)
 		} else {
 			res.Header.AddBytesKV(hf.KeyBytes(), hf.ValueBytes())

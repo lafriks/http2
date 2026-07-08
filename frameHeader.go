@@ -55,6 +55,10 @@ type FrameHeader struct {
 	rawHeader       [DefaultFrameSize]byte
 	payload         []byte
 	payloadBorrowed bool
+	// ownedPayload keeps the header's own buffer while payload borrows
+	// one from the frame body, so severing the borrow restores the owned
+	// capacity instead of dropping it
+	ownedPayload []byte
 
 	fr Frame
 }
@@ -74,10 +78,11 @@ func ReleaseFrameHeader(fr *FrameHeader) {
 }
 
 // severBorrowedPayload drops a payload borrowed from the frame body, so
-// the pooled header can't reach into a buffer it doesn't own.
+// the pooled header can't reach into a buffer it doesn't own; the
+// header's own buffer takes its place again.
 func (f *FrameHeader) severBorrowedPayload() {
 	if f.payloadBorrowed {
-		f.payload = nil
+		f.payload = f.ownedPayload[:0]
 		f.payloadBorrowed = false
 	}
 }
@@ -280,6 +285,10 @@ func (f *FrameHeader) setPayload(payload []byte) {
 // setPayloadNoCopy points the header at a payload buffer the frame body
 // owns, skipping the copy.
 func (f *FrameHeader) setPayloadNoCopy(payload []byte) {
+	if !f.payloadBorrowed {
+		f.ownedPayload = f.payload
+	}
+
 	f.payload = payload
 	f.payloadBorrowed = true
 }

@@ -2143,12 +2143,10 @@ func fasthttpResponseHeaders(dst *Headers, hp *HPACK, res *fasthttp.Response) {
 	hf := AcquireHeaderField()
 	defer ReleaseHeaderField(hf)
 
+	var status [8]byte
+
 	hf.SetKeyBytes(StringStatus)
-	hf.SetValue(
-		strconv.FormatInt(
-			int64(res.Header.StatusCode()), 10,
-		),
-	)
+	hf.SetValueBytes(strconv.AppendInt(status[:0], int64(res.Header.StatusCode()), 10))
 
 	dst.AppendHeaderField(hp, hf, true)
 

@@ -2238,6 +2238,57 @@ func TestStreamRequestBody(t *testing.T) {
 	}
 }
 
+func BenchmarkServerGet(b *testing.B) {
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				ctx.WriteString("hello world")
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	b.ReportAllocs()
+
+	id := uint32(3)
+	for b.Loop() {
+		// write and release explicitly: c.writeFrame leaves the frame to
+		// the caller, and leaking it would empty the frame pools and
+		// distort the measurement
+		fr := makeHeadersOrdered(id, c.enc, true, true, [][2]string{
+			{":method", "GET"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+		})
+		err := c.writeFrame(fr)
+		ReleaseFrameHeader(fr)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		for {
+			fr, err := c.readNext()
+			if err != nil {
+				b.Fatal(err)
+			}
+			done := fr.Stream() == id && fr.Flags().Has(FlagEndStream)
+			ReleaseFrameHeader(fr)
+			if done {
+				break
+			}
+		}
+
+		id += 2
+	}
+}
+
 func BenchmarkStreamRequestBody(b *testing.B) {
 	s := &Server{
 		s: &fasthttp.Server{
