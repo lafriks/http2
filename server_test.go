@@ -2238,6 +2238,59 @@ func TestStreamRequestBody(t *testing.T) {
 	}
 }
 
+func BenchmarkStreamRequestBody(b *testing.B) {
+	s := &Server{
+		s: &fasthttp.Server{
+			StreamRequestBody: true,
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				_, _ = io.Copy(io.Discard, ctx.Request.BodyStream())
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	body := make([]byte, 16<<10)
+
+	b.ReportAllocs()
+
+	id := uint32(3)
+	for b.Loop() {
+		if err := c.writeFrame(makeHeadersOrdered(id, c.enc, true, false, [][2]string{
+			{":method", "POST"}, {":path", "/"}, {":scheme", "https"}, {":authority", "localhost"},
+		})); err != nil {
+			b.Fatal(err)
+		}
+		if err := writeDataFrame(c, id, true, body); err != nil {
+			b.Fatal(err)
+		}
+
+		// drain frames (responses and window refunds) until the response
+		// of this request completes
+		for {
+			fr, err := c.readNext()
+			if err != nil {
+				b.Fatal(err)
+			}
+			done := fr.Stream() == id && fr.Flags().Has(FlagEndStream)
+			ReleaseFrameHeader(fr)
+			if done {
+				break
+			}
+		}
+
+		id += 2
+	}
+}
+
 func TestStreamRequestBodyReset(t *testing.T) {
 	readErr := make(chan error, 1)
 

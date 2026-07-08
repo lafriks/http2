@@ -612,6 +612,7 @@ func (sc *serverConn) handleStreams() {
 			// body pipe and let the handlerDone case do the recycling
 			strm.body.closeWithError(io.ErrUnexpectedEOF)
 		} else {
+			releaseStreamBody(strm)
 			ctxPool.Put(strm.ctx)
 			streamPool.Put(strm)
 		}
@@ -726,6 +727,7 @@ loop:
 				// closeStream already did the accounting and ended the
 				// body pipe, only the recycling waited for the handler
 				// to let go of the ctx
+				releaseStreamBody(strm)
 				ctxPool.Put(strm.ctx)
 				streamPool.Put(strm)
 
@@ -1777,7 +1779,7 @@ func (sc *serverConn) verifyState(strm *Stream, fr *FrameHeader) error {
 // comes back through handlerDone.
 func (sc *serverConn) dispatchStream(strm *Stream) {
 	strm.dispatched = true
-	strm.body = newRequestBody(sc, strm.ID(), &strm.ctx.Request)
+	strm.body = acquireRequestBody(sc, strm.ID(), &strm.ctx.Request)
 
 	ctx := strm.ctx
 	ctx.Request.Header.SetProtocolBytes(StringHTTP2)

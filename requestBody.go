@@ -55,15 +55,50 @@ type requestBody struct {
 	req    *fasthttp.Request
 }
 
-func newRequestBody(sc *serverConn, strmID uint32, req *fasthttp.Request) *requestBody {
-	rb := &requestBody{
-		sc:     sc,
-		strmID: strmID,
-		req:    req,
-	}
-	rb.cond.L = &rb.mu
+var requestBodyPool = sync.Pool{
+	New: func() any {
+		rb := &requestBody{}
+		rb.cond.L = &rb.mu
+
+		return rb
+	},
+}
+
+// acquireRequestBody returns a body pipe ready for a stream.
+func acquireRequestBody(sc *serverConn, strmID uint32, req *fasthttp.Request) *requestBody {
+	rb := requestBodyPool.Get().(*requestBody)
+	rb.sc = sc
+	rb.strmID = strmID
+	rb.req = req
 
 	return rb
+}
+
+// releaseRequestBody recycles rb.
+func releaseRequestBody(rb *requestBody) {
+	rb.buf = rb.buf[:0]
+	rb.off = 0
+	rb.err = nil
+	rb.pending = 0
+	rb.trailer = rb.trailer[:0]
+	rb.sc = nil
+	rb.strmID = 0
+	rb.req = nil
+
+	requestBodyPool.Put(rb)
+}
+
+// releaseStreamBody detaches a stream's body pipe from its request and
+// recycles it.
+func releaseStreamBody(strm *Stream) {
+	if strm.body == nil {
+		return
+	}
+
+	strm.ctx.Request.ResetBody()
+
+	releaseRequestBody(strm.body)
+	strm.body = nil
 }
 
 // write appends a DATA payload for the handler. It never blocks, and the
