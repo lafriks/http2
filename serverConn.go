@@ -19,6 +19,48 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
+// ratelim is a token-bucket rate limiter used for rapid-reset detection
+// (RFC 9113 §10.6). Constants match nghttp2's defaults.
+//
+//	burst = 1000 — tokens available at connection open; allows legitimate
+//	               bursts (browser prefetch cancellations, etc.)
+//	rate  = 33   — tokens regenerated per second; sustained attack rate
+//	               above 33 RST_STREAMs/sec triggers the defence
+type ratelim struct {
+	val  int64 // current token count
+	last int64 // last refill timestamp (Unix seconds)
+}
+
+const (
+	ratelimBurst = 1000
+	ratelimRate  = 33
+)
+
+func newRatelim() ratelim {
+	return ratelim{
+		val:  ratelimBurst,
+		last: time.Now().Unix(),
+	}
+}
+
+// allow drains one token. Returns false (bucket exhausted) when the caller
+// should close the connection with ENHANCE_YOUR_CALM.
+func (r *ratelim) allow() bool {
+	now := time.Now().Unix()
+	if elapsed := now - r.last; elapsed > 0 {
+		r.val = min(r.val+elapsed*ratelimRate, ratelimBurst)
+		r.last = now
+	}
+
+	if r.val <= 0 {
+		return false
+	}
+
+	r.val--
+
+	return true
+}
+
 type connState int32
 
 const (
@@ -459,6 +501,8 @@ func (sc *serverConn) handleStreams() {
 	var strms Streams
 	var reqTimerArmed bool
 	var openStreams int
+
+	rstLim := newRatelim() // rapid-reset token bucket
 
 	// closedStrms remembers the streams that already ended; the value
 	// records whether the server reset them, in which case frames the
@@ -928,6 +972,16 @@ loop:
 			}
 
 			handleState(fr, strm)
+
+			// rapid-reset detection: drain one token per client RST_STREAM;
+			// close with ENHANCE_YOUR_CALM when the bucket empties
+			if fr.Type() == FrameResetStream && !strm.resetByServer {
+				if !rstLim.allow() {
+					sc.writeGoAway(0, EnhanceYourCalm, "rapid reset detected")
+					sc.writeFrame(closeConnSentinel)
+					break loop
+				}
+			}
 
 			// a request over MaxRequestBodySize or with an over-limit
 			// header list doesn't need the rest of its body: answer with

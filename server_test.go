@@ -2739,3 +2739,144 @@ func TestClientStreamedRequestBodyEarlyResponse(t *testing.T) {
 		t.Fatalf("second request: got %q, want %q", got, "done")
 	}
 }
+
+func writeRstStreamFrame(c *Conn, id uint32, code ErrorCode) error {
+	rst := AcquireFrame(FrameResetStream).(*RstStream)
+	rst.SetCode(code)
+
+	fr := AcquireFrameHeader()
+	fr.SetStream(id)
+	fr.SetBody(rst)
+
+	return c.writeFrame(fr)
+}
+
+func TestRapidResetDetected(t *testing.T) {
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				ctx.WriteString("OK")
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	hs := map[string]string{
+		string(StringAuthority): "localhost",
+		string(StringMethod):    "GET",
+		string(StringPath):      "/",
+		string(StringScheme):    "https",
+	}
+
+	// Simulate a rapid-reset attack: pipeline ratelimBurst+1 HEADERS+RST
+	// pairs without flushing between them so they all arrive within the
+	// same second (no token regeneration). The server must exhaust the
+	// bucket and close the connection with ENHANCE_YOUR_CALM.
+	id := uint32(3)
+	for range ratelimBurst + 1 {
+		// HEADERS without END_STREAM: stream stays open momentarily
+		if _, err := makeHeaders(id, c.enc, true, false, hs).WriteTo(c.bw); err != nil {
+			break // server already closed
+		}
+
+		// immediately cancel the stream
+		rst := AcquireFrame(FrameResetStream).(*RstStream)
+		rst.SetCode(NoError)
+		fr := AcquireFrameHeader()
+		fr.SetStream(id)
+		fr.SetBody(rst)
+		_, err = fr.WriteTo(c.bw)
+		ReleaseFrameHeader(fr)
+		if err != nil {
+			break // server already closed
+		}
+
+		id += 2
+	}
+	_ = c.bw.Flush()
+
+	// drain frames until GOAWAY arrives as an error (readNext returns
+	// connection-level GOAWAY as *GoAway, not as a frame)
+	var gaErr *GoAway
+	for {
+		fr, err := c.readNext()
+		if err != nil {
+			var ok bool
+			gaErr, ok = err.(*GoAway)
+			if !ok {
+				t.Fatalf("expected GOAWAY error, got %v", err)
+			}
+			break
+		}
+		ReleaseFrameHeader(fr)
+	}
+
+	if gaErr.Code() != EnhanceYourCalm {
+		t.Fatalf("expected ENHANCE_YOUR_CALM GOAWAY, got %s", gaErr.Code())
+	}
+}
+
+func TestRapidResetNotTriggeredByNormalTraffic(t *testing.T) {
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				ctx.WriteString("OK")
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	hs := map[string]string{
+		string(StringAuthority): "localhost",
+		string(StringMethod):    "GET",
+		string(StringPath):      "/",
+		string(StringScheme):    "https",
+	}
+
+	// Normal traffic: complete requests (no RSTs). Well over rapidResetWindow
+	// in count; the connection must remain open and healthy.
+	id := uint32(3)
+	for range 50 {
+		c.writeFrame(makeHeaders(id, c.enc, true, true, hs))
+
+		for _, expect := range []FrameType{FrameHeaders, FrameData} {
+			fr, err := c.readNext()
+			if err != nil {
+				t.Fatalf("stream %d: %v", id, err)
+			}
+			if fr.Type() != expect {
+				t.Fatalf("stream %d: expected %s, got %s", id, expect, fr.Type())
+			}
+			ReleaseFrameHeader(fr)
+		}
+
+		id += 2
+	}
+}
+
