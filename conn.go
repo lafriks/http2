@@ -1125,11 +1125,17 @@ func (c *Conn) handlePing(ping *Ping) {
 	// reply back
 	fr := AcquireFrameHeader()
 
-	ping.SetAck(true)
+	pong := AcquireFrame(FramePing).(*Ping)
+	pong.SetAck(true)
+	pong.SetData(ping.Data())
 
-	fr.SetBody(ping)
+	fr.SetBody(pong)
 
-	c.out <- fr
+	select {
+	case c.out <- fr:
+	default:
+		ReleaseFrameHeader(fr)
+	}
 }
 
 // ErrStreamRefused is returned for requests whose stream the server reset

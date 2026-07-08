@@ -199,7 +199,11 @@ func (sc *serverConn) gracefulShutdown() {
 }
 
 func (sc *serverConn) closeIdleConn() {
-	sc.writeGoAway(0, NoError, "connection has been idle for a long time")
+	if !sc.tryWriteFrame(sc.newGoAwayFrame(0, NoError, "connection has been idle for a long time")) {
+		_ = sc.c.Close()
+	}
+	sc.setState(connStateClosed)
+
 	if sc.debug {
 		sc.logger.Printf("Connection is idle. Closing\n")
 	}
@@ -309,12 +313,41 @@ func (sc *serverConn) writeFrame(fr *FrameHeader) {
 	sc.writer <- fr
 }
 
+// tryWriteFrame queues fr without blocking and reports whether it fit.
+// The writer queue only fills up while the writeLoop is stalled on a client
+// that stopped reading (without a WriteTimeout that write never returns):
+// the paths that must keep making progress behind such a client — PING acks
+// on the readLoop and the connection teardown — use this instead of
+// writeFrame so the stall can't spread to them.
+func (sc *serverConn) tryWriteFrame(fr *FrameHeader) (ok bool) {
+	defer func() {
+		if err := recover(); err != nil {
+			sc.logger.Printf("Serve panicked: %s:\n%s\n", err, debug.Stack())
+		}
+	}()
+
+	select {
+	case sc.writer <- fr:
+		return true
+	default:
+		if fr != closeConnSentinel {
+			ReleaseFrameHeader(fr)
+		}
+
+		return false
+	}
+}
+
 func (sc *serverConn) handlePing(ping *Ping) {
 	fr := AcquireFrameHeader()
-	ping.SetAck(true)
-	fr.SetBody(ping)
 
-	sc.writeFrame(fr)
+	pong := AcquireFrame(FramePing).(*Ping)
+	pong.SetAck(true)
+	pong.SetData(ping.Data())
+
+	fr.SetBody(pong)
+
+	_ = sc.tryWriteFrame(fr)
 }
 
 func (sc *serverConn) writePing() {
@@ -366,8 +399,12 @@ func (sc *serverConn) checkFrameWithStream(fr *FrameHeader) error {
 // closes the connection, and the incoming bytes are drained until the
 // connection dies so the teardown can't cut the GOAWAY short.
 func (sc *serverConn) fatalConnError(code ErrorCode, message string) {
-	sc.writeGoAway(0, code, message)
-	sc.writeFrame(closeConnSentinel)
+	sc.setState(connStateClosed)
+
+	if !sc.tryWriteFrame(sc.newGoAwayFrame(0, code, message)) ||
+		!sc.tryWriteFrame(closeConnSentinel) {
+		_ = sc.c.Close()
+	}
 
 	_, _ = io.Copy(io.Discard, sc.br)
 }
@@ -385,6 +422,8 @@ func (sc *serverConn) readLoop() (err error) {
 	// header block must be a contiguous run of HEADERS/CONTINUATION frames
 	// (RFC 9113, section 4.3)
 	var headerBlockStream uint32
+
+	pingLim := newRatelim() // PING flood token bucket
 
 	for err == nil {
 		fr, err = ReadFrameFromWithSize(sc.br, sc.clientS.frameSize)
@@ -458,7 +497,11 @@ func (sc *serverConn) readLoop() (err error) {
 		case FramePing:
 			ping := fr.Body().(*Ping)
 			if !ping.IsAck() {
-				sc.handlePing(ping)
+				if !pingLim.allow() {
+					err = NewGoAwayError(EnhanceYourCalm, "ping flood detected")
+				} else {
+					sc.handlePing(ping)
+				}
 			} else if bytes.Equal(ping.Data(), shutdownPingData[:]) {
 				select {
 				case sc.pingAck <- struct{}{}:
@@ -727,8 +770,12 @@ loop:
 			// the GOAWAY has been queued by closeIdleConn already; closing
 			// the connection through the writeLoop instead of breaking the
 			// loop lets the regular teardown close sc.writer once nothing
-			// can write to it anymore
-			sc.writeFrame(closeConnSentinel)
+			// can write to it anymore. If the sentinel doesn't fit the
+			// writeLoop is stalled on a client that stopped reading: close
+			// the connection directly to unwedge it.
+			if !sc.tryWriteFrame(closeConnSentinel) {
+				_ = sc.c.Close()
+			}
 		case <-shutdownCh:
 			shutdownCh = nil
 
@@ -1122,7 +1169,8 @@ func (sc *serverConn) updateWindow(streamID uint32, size int) {
 
 // writeGoAwayFrame only queues the GOAWAY frame, leaving the connection
 // state untouched.
-func (sc *serverConn) writeGoAwayFrame(strm uint32, code ErrorCode, message string) {
+// newGoAwayFrame builds a GOAWAY frame ready to be queued.
+func (sc *serverConn) newGoAwayFrame(strm uint32, code ErrorCode, message string) *FrameHeader {
 	ga := AcquireFrame(FrameGoAway).(*GoAway)
 
 	fr := AcquireFrameHeader()
@@ -1133,14 +1181,18 @@ func (sc *serverConn) writeGoAwayFrame(strm uint32, code ErrorCode, message stri
 
 	fr.SetBody(ga)
 
-	sc.writeFrame(fr)
-
 	if sc.debug {
 		sc.logger.Printf(
 			"%s: GoAway(stream=%d, code=%s): %s\n",
 			sc.c.RemoteAddr(), strm, code, message,
 		)
 	}
+
+	return fr
+}
+
+func (sc *serverConn) writeGoAwayFrame(strm uint32, code ErrorCode, message string) {
+	sc.writeFrame(sc.newGoAwayFrame(strm, code, message))
 }
 
 func (sc *serverConn) writeGoAway(strm uint32, code ErrorCode, message string) {

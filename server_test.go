@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"testing"
 	"time"
@@ -2781,32 +2782,42 @@ func TestRapidResetDetected(t *testing.T) {
 		string(StringScheme):    "https",
 	}
 
-	// Simulate a rapid-reset attack: pipeline ratelimBurst+1 HEADERS+RST
-	// pairs without flushing between them so they all arrive within the
-	// same second (no token regeneration). The server must exhaust the
-	// bucket and close the connection with ENHANCE_YOUR_CALM.
-	id := uint32(3)
-	for range ratelimBurst + 1 {
-		// HEADERS without END_STREAM: stream stays open momentarily
-		if _, err := makeHeaders(id, c.enc, true, false, hs).WriteTo(c.bw); err != nil {
-			break // server already closed
-		}
+	// Simulate a rapid-reset attack: HEADERS immediately followed by
+	// RST_STREAM, over and over. Keep going until the server closes the
+	// connection instead of stopping at a fixed count: the bucket refills
+	// ratelimRate tokens whenever the wall clock crosses a second
+	// boundary, so exactly ratelimBurst+1 pairs is not always enough to
+	// exhaust it. Write in a goroutine so the main goroutine can
+	// concurrently drain the server's responses.
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
 
-		// immediately cancel the stream
-		rst := AcquireFrame(FrameResetStream).(*RstStream)
-		rst.SetCode(NoError)
-		fr := AcquireFrameHeader()
-		fr.SetStream(id)
-		fr.SetBody(rst)
-		_, err = fr.WriteTo(c.bw)
-		ReleaseFrameHeader(fr)
-		if err != nil {
-			break // server already closed
-		}
+		id := uint32(3)
+		for {
+			// HEADERS without END_STREAM: stream stays open momentarily
+			if _, err := makeHeaders(id, c.enc, true, false, hs).WriteTo(c.bw); err != nil {
+				return // server already closed
+			}
 
-		id += 2
-	}
-	_ = c.bw.Flush()
+			// immediately cancel the stream
+			rst := AcquireFrame(FrameResetStream).(*RstStream)
+			rst.SetCode(NoError)
+			fr := AcquireFrameHeader()
+			fr.SetStream(id)
+			fr.SetBody(rst)
+			_, err := fr.WriteTo(c.bw)
+			ReleaseFrameHeader(fr)
+			if err != nil {
+				return // server already closed
+			}
+			if err := c.bw.Flush(); err != nil {
+				return
+			}
+
+			id += 2
+		}
+	}()
 
 	// drain frames until GOAWAY arrives as an error (readNext returns
 	// connection-level GOAWAY as *GoAway, not as a frame)
@@ -2823,6 +2834,8 @@ func TestRapidResetDetected(t *testing.T) {
 		}
 		ReleaseFrameHeader(fr)
 	}
+
+	<-writeDone
 
 	if gaErr.Code() != EnhanceYourCalm {
 		t.Fatalf("expected ENHANCE_YOUR_CALM GOAWAY, got %s", gaErr.Code())
@@ -2880,3 +2893,125 @@ func TestRapidResetNotTriggeredByNormalTraffic(t *testing.T) {
 	}
 }
 
+func TestPingFloodDetected(t *testing.T) {
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				ctx.WriteString("OK")
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetReadDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The server sends a PONG for every accepted PING, so writing all the
+	// PINGs before reading would deadlock (the server→client pipe fills up,
+	// blocking the writeLoop which then blocks the readLoop which then
+	// blocks bw.Flush).  Write in a goroutine so the main goroutine can
+	// concurrently drain the server's responses.
+	//
+	// Keep writing until the server closes the connection instead of
+	// stopping at a fixed count: the bucket refills ratelimRate tokens
+	// whenever the wall clock crosses a second boundary, so exactly
+	// ratelimBurst+1 PINGs is not always enough to exhaust it.
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		for {
+			ping := AcquireFrame(FramePing).(*Ping)
+			fr := AcquireFrameHeader()
+			fr.SetBody(ping)
+			_, err := fr.WriteTo(c.bw)
+			ReleaseFrameHeader(fr)
+			if err != nil {
+				return // server already closed
+			}
+			if err := c.bw.Flush(); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Drain PONGs and wait for the GOAWAY that signals exhaustion of the
+	// token bucket.  Read raw frames to avoid readNext's internal looping.
+	var gaErr *GoAway
+	for {
+		fr, err := ReadFrameFrom(c.br)
+		if err != nil {
+			t.Fatalf("unexpected read error: %v", err)
+		}
+		if fr.Type() == FrameGoAway {
+			gaErr = fr.Body().(*GoAway)
+			ReleaseFrameHeader(fr)
+			break
+		}
+		ReleaseFrameHeader(fr)
+	}
+
+	<-writeDone
+
+	if gaErr.Code() != EnhanceYourCalm {
+		t.Fatalf("expected ENHANCE_YOUR_CALM GOAWAY, got %s", gaErr.Code())
+	}
+}
+
+func TestPingFloodClientNotReading(t *testing.T) {
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	if err := c.c.SetWriteDeadline(time.Now().Add(time.Second * 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Flood PINGs without ever reading the acks. The acks stall the
+	// writeLoop and fill the writer queue; the readLoop must survive that
+	// (dropping the acks it can't deliver) so the flood detection still
+	// trips and closes the connection — observed here as a write error.
+	// A timeout instead means the server wedged with the readLoop blocked
+	// on the full writer queue.
+	for range 100_000 {
+		ping := AcquireFrame(FramePing).(*Ping)
+		fr := AcquireFrameHeader()
+		fr.SetBody(ping)
+		_, err = fr.WriteTo(c.bw)
+		ReleaseFrameHeader(fr)
+		if err == nil {
+			err = c.bw.Flush()
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	if err == nil {
+		t.Fatal("server accepted 100k unread PINGs without closing the connection")
+	}
+	if os.IsTimeout(err) {
+		t.Fatalf("server wedged instead of closing the connection: %v", err)
+	}
+}
