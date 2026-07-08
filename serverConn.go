@@ -25,7 +25,7 @@ import (
 //	burst = 1000 — tokens available at connection open; allows legitimate
 //	               bursts (browser prefetch cancellations, etc.)
 //	rate  = 33   — tokens regenerated per second; sustained attack rate
-//	               above 33 RST_STREAMs/sec triggers the defence
+//	               above 33 RST_STREAMs/sec triggers the defense
 type ratelim struct {
 	val  int64 // current token count
 	last int64 // last refill timestamp (Unix seconds)

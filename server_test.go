@@ -2890,19 +2890,10 @@ func TestRapidResetDetected(t *testing.T) {
 				return // server already closed
 			}
 
-			// immediately cancel the stream
-			rst := AcquireFrame(FrameResetStream).(*RstStream)
-			rst.SetCode(NoError)
-			fr := AcquireFrameHeader()
-			fr.SetStream(id)
-			fr.SetBody(rst)
-			_, err := fr.WriteTo(c.bw)
-			ReleaseFrameHeader(fr)
-			if err != nil {
+			// immediately cancel the stream; writeRstStreamFrame flushes,
+			// pushing the HEADERS out along with the RST_STREAM
+			if err := writeRstStreamFrame(c, id, NoError); err != nil {
 				return // server already closed
-			}
-			if err := c.bw.Flush(); err != nil {
-				return
 			}
 
 			id += 2
