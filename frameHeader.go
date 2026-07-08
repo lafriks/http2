@@ -52,8 +52,9 @@ type FrameHeader struct {
 
 	maxLen uint32
 
-	rawHeader [DefaultFrameSize]byte
-	payload   []byte
+	rawHeader       [DefaultFrameSize]byte
+	payload         []byte
+	payloadBorrowed bool
 
 	fr Frame
 }
@@ -67,8 +68,18 @@ func AcquireFrameHeader() *FrameHeader {
 
 // ReleaseFrameHeader reset and puts fr to the pool.
 func ReleaseFrameHeader(fr *FrameHeader) {
+	fr.severBorrowedPayload()
 	ReleaseFrame(fr.Body())
 	frameHeaderPool.Put(fr)
+}
+
+// severBorrowedPayload drops a payload borrowed from the frame body, so
+// the pooled header can't reach into a buffer it doesn't own.
+func (f *FrameHeader) severBorrowedPayload() {
+	if f.payloadBorrowed {
+		f.payload = nil
+		f.payloadBorrowed = false
+	}
 }
 
 // Reset resets header values.
@@ -79,6 +90,7 @@ func (f *FrameHeader) Reset() {
 	f.length = 0
 	f.maxLen = defaultMaxLen
 	f.fr = nil
+	f.severBorrowedPayload()
 	f.payload = f.payload[:0]
 }
 
@@ -242,6 +254,8 @@ func (f *FrameHeader) WriteTo(w *bufio.Writer) (wb int64, err error) {
 		wb += int64(n)
 	}
 
+	f.severBorrowedPayload()
+
 	return wb, err
 }
 
@@ -259,7 +273,15 @@ func (f *FrameHeader) SetBody(fr Frame) {
 }
 
 func (f *FrameHeader) setPayload(payload []byte) {
+	f.severBorrowedPayload()
 	f.payload = append(f.payload[:0], payload...)
+}
+
+// setPayloadNoCopy points the header at a payload buffer the frame body
+// owns, skipping the copy.
+func (f *FrameHeader) setPayloadNoCopy(payload []byte) {
+	f.payload = payload
+	f.payloadBorrowed = true
 }
 
 func (f *FrameHeader) checkLen() error {

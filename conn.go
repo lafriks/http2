@@ -792,7 +792,7 @@ func writeData(bw *bufio.Writer, fh *FrameHeader, body []byte) (err error) {
 
 		data.SetEndStream(i+step == len(body))
 		data.SetPadding(false)
-		data.SetData(body[i : step+i])
+		data.SetDataNoCopy(body[i : step+i])
 
 		_, err = fh.WriteTo(bw)
 	}

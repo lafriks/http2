@@ -202,7 +202,7 @@ const (
 
 var bytePool = sync.Pool{
 	New: func() any {
-		return make([]byte, 128)
+		return make([]byte, 512)
 	},
 }
 

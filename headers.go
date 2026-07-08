@@ -166,5 +166,5 @@ func (h *Headers) Serialize(frh *FrameHeader) {
 		h.rawHeaders = http2utils.AddPadding(h.rawHeaders)
 	}
 
-	frh.payload = append(frh.payload[:0], h.rawHeaders...)
+	frh.setPayloadNoCopy(h.rawHeaders)
 }
