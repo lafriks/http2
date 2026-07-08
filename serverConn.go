@@ -140,6 +140,11 @@ type serverConn struct {
 	// HPACK encoder. Buffered to the stream limit: handlers never block
 	// on it, even when the frame loop is already gone.
 	handlerDone chan *Stream
+	// handlerTasks hands dispatched streams to an idle handler worker
+	// (see dispatchStream), so sequential streamed requests reuse a
+	// goroutine instead of spawning one each. Unbuffered: a send only
+	// succeeds when a worker is already parked waiting for work.
+	handlerTasks chan *Stream
 
 	// maxRequestBodySize limits how much of a request body is buffered,
 	// mirroring fasthttp.Server.MaxRequestBodySize
@@ -222,6 +227,7 @@ func (sc *serverConn) Serve() error {
 	sc.encTableSize.Store(-1)
 	sc.windowPoke = make(chan struct{}, 1)
 	sc.handlerDone = make(chan *Stream, sc.st.maxStreams)
+	sc.handlerTasks = make(chan *Stream)
 
 	// create the timer before spawning the writeLoop and readLoop
 	// goroutines: they and the timer callback read sc.pingTimer, so a
@@ -258,6 +264,9 @@ func (sc *serverConn) Serve() error {
 		// close the writer here to ensure that no pending requests
 		// are writing to a closed channel
 		close(sc.writer)
+		// handleStreams was the only dispatcher: closing the task channel
+		// releases the parked handler workers
+		close(sc.handlerTasks)
 	}()
 
 	defer func() {
@@ -1789,18 +1798,57 @@ func (sc *serverConn) dispatchStream(strm *Stream) {
 		sc.logger.Printf("Stream %d dispatched with the body in flight\n", strm.ID())
 	}
 
-	go func() {
-		defer func() {
-			if err := recover(); err != nil {
-				sc.logger.Printf("handler panicked: %s\n%s\n", err, debug.Stack())
-				ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
+	// hand the stream to a parked worker; only when none is idle does a
+	// new one spawn. Workers are never awaited for: a bounded pool would
+	// stall new requests behind handlers blocked on slow uploads.
+	select {
+	case sc.handlerTasks <- strm:
+	default:
+		go sc.handlerWorker(strm)
+	}
+}
+
+// handlerWorkerIdleTime is how long a handler worker stays parked waiting
+// for the connection's next streamed request before exiting.
+const handlerWorkerIdleTime = 10 * time.Second
+
+// handlerWorker runs dispatched handlers, then parks on handlerTasks to be
+// reused by the next streamed request; it exits after sitting idle for
+// handlerWorkerIdleTime or when the connection tears down.
+func (sc *serverConn) handlerWorker(strm *Stream) {
+	idle := time.NewTimer(handlerWorkerIdleTime)
+	defer idle.Stop()
+
+	for {
+		sc.runHandler(strm)
+
+		idle.Reset(handlerWorkerIdleTime)
+
+		var ok bool
+		select {
+		case strm, ok = <-sc.handlerTasks:
+			if !ok {
+				return
 			}
+		case <-idle.C:
+			return
+		}
+	}
+}
 
-			sc.handlerDone <- strm
-		}()
+// runHandler runs the handler of a dispatched stream and reports it back
+// to the frame loop, which owns the response writing.
+func (sc *serverConn) runHandler(strm *Stream) {
+	defer func() {
+		if err := recover(); err != nil {
+			sc.logger.Printf("handler panicked: %s\n%s\n", err, debug.Stack())
+			strm.ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
+		}
 
-		sc.h(ctx)
+		sc.handlerDone <- strm
 	}()
+
+	sc.h(strm.ctx)
 }
 
 // handleEndRequest dispatches the finished request to the handler.
