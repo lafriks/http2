@@ -129,6 +129,11 @@ type Conn struct {
 
 	in  chan *Ctx
 	out chan *FrameHeader
+	// bodyTasks hands streamed request bodies to an idle sender worker
+	// (see writeRequest): sequential uploads reuse a goroutine instead of
+	// spawning one each. Unbuffered: a send only succeeds when a worker
+	// is already parked waiting.
+	bodyTasks chan bodyTask
 
 	pingInterval time.Duration
 
@@ -160,6 +165,7 @@ func NewConn(c net.Conn, opts ConnOpts) *Conn {
 		serverInitialWindow: 65535,
 		in:                  make(chan *Ctx, 128),
 		out:                 make(chan *FrameHeader, 128),
+		bodyTasks:           make(chan bodyTask),
 		closeCh:             make(chan struct{}),
 		pingInterval:        opts.PingInterval,
 		disableAcks:         opts.DisablePingChecking,
@@ -468,6 +474,9 @@ func (c *Conn) writeLoop() {
 	var lastErr error
 
 	defer func() { _ = c.Close() }()
+	// writeRequest (only run here) was the only dispatcher: closing the
+	// task channel releases the parked body-sender workers
+	defer close(c.bodyTasks)
 
 	defer func() {
 		if err := recover(); err != nil {
@@ -741,7 +750,14 @@ func (c *Conn) writeRequest(ctx *Ctx) error {
 			ctx.bodySending = true
 			c.sendMu.Unlock()
 
-			go c.sendRequestBody(ctx, id)
+			// hand the body to a parked worker; only when none is idle
+			// does a new one spawn (a bounded pool would stall uploads
+			// behind windows the server opens at its own pace)
+			select {
+			case c.bodyTasks <- bodyTask{ctx: ctx, id: id}:
+			default:
+				go c.bodySenderWorker(bodyTask{ctx: ctx, id: id})
+			}
 		}
 	}
 
@@ -886,7 +902,38 @@ func (c *Conn) abortRequestBody(id uint32) {
 	}
 }
 
-// sendRequestBody streams a request body on its own goroutine, paced by
+// bodyTask is a queued request-body upload: the request's ctx and its
+// stream ID.
+type bodyTask struct {
+	ctx *Ctx
+	id  uint32
+}
+
+// bodySenderWorker runs queued body uploads, then parks on bodyTasks to be
+// reused by the next one; it exits after sitting idle for
+// handlerWorkerIdleTime or when the connection tears down.
+func (c *Conn) bodySenderWorker(t bodyTask) {
+	idle := time.NewTimer(handlerWorkerIdleTime)
+	defer idle.Stop()
+
+	for {
+		c.sendRequestBody(t.ctx, t.id)
+
+		idle.Reset(handlerWorkerIdleTime)
+
+		var ok bool
+		select {
+		case t, ok = <-c.bodyTasks:
+			if !ok {
+				return
+			}
+		case <-idle.C:
+			return
+		}
+	}
+}
+
+// sendRequestBody streams a request body on a body-sender worker, paced by
 // the server's flow-control windows. The DATA frames travel through c.out,
 // so control frames and other requests keep flowing while this body waits
 // for window; the last frame carries END_STREAM. When the request finishes

@@ -2648,7 +2648,7 @@ func (neverEndingReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func newClientConn(t *testing.T, s *Server) (*Conn, net.Listener) {
+func newClientConn(t testing.TB, s *Server) (*Conn, net.Listener) {
 	t.Helper()
 
 	s.cnf.defaults()
@@ -2670,7 +2670,7 @@ func newClientConn(t *testing.T, s *Server) (*Conn, net.Listener) {
 	return c, ln
 }
 
-func doRequest(t *testing.T, c *Conn, req *fasthttp.Request, res *fasthttp.Response) {
+func doRequest(t testing.TB, c *Conn, req *fasthttp.Request, res *fasthttp.Response) {
 	t.Helper()
 
 	ctx := &Ctx{
@@ -2688,6 +2688,43 @@ func doRequest(t *testing.T, c *Conn, req *fasthttp.Request, res *fasthttp.Respo
 		}
 	case <-time.After(time.Second * 10):
 		t.Fatal("request timed out")
+	}
+}
+
+func BenchmarkClientStreamedRequestBody(b *testing.B) {
+	s := &Server{
+		s: &fasthttp.Server{
+			StreamRequestBody: true,
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				_, _ = io.Copy(io.Discard, ctx.Request.BodyStream())
+			},
+		},
+		cnf: ServerConfig{
+			PingInterval: -1,
+		},
+	}
+
+	c, ln := newClientConn(b, s)
+	defer c.Close()
+	defer ln.Close()
+
+	body := make([]byte, 16<<10)
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		req := fasthttp.AcquireRequest()
+		res := fasthttp.AcquireResponse()
+		req.SetRequestURI("https://localhost/")
+		req.Header.SetMethod("POST")
+		// a body stream always goes out through the flow-controlled
+		// sender, regardless of size
+		req.SetBodyStream(bytes.NewReader(body), len(body))
+
+		doRequest(b, c, req, res)
+
+		fasthttp.ReleaseRequest(req)
+		fasthttp.ReleaseResponse(res)
 	}
 }
 
